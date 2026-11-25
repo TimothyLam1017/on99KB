@@ -1,13 +1,13 @@
 [package]
 name = "on99kb"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 authors = ["Timothy Lam <him1017@gmail.com>"]
-description = "Resizable always-on-top Windows on-screen keyboard for IBM CP437 / classic Alt+numpad characters."
+description = "Resizable always-on-top Windows on-screen keyboard for IBM CP437 and Hong Kong 速成 (Simplex)."
 license = "MIT"
 repository = "https://github.com/TimothyLam1017/on99KB"
 readme = "README.md"
-keywords = ["keyboard", "cp437", "windows", "accessibility"]
+keywords = ["keyboard", "cp437", "simplex", "windows", "accessibility"]
 categories = ["gui"]
 publish = false
 

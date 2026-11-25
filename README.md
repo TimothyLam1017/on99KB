@@ -1,32 +1,38 @@
 # on99KB
 
-A resizable, always-on-top Windows on-screen keyboard for the classic IBM **CP437** / DOS Alt+numpad characters (Alt+1 through Alt+255).
+A resizable, always-on-top Windows on-screen keyboard for the classic IBM **CP437** / DOS Alt+numpad characters (Alt+1 through Alt+255) and Hong Kong **速成** (Simplex / Quick, first and last Cangjie codes), including HKSCS-2016 characters as completely as practical.
 
-Clicking a key types that character into the **previously focused** window. The keyboard itself does not steal focus, so you can keep Notepad, a browser, or a terminal focused and use this tool to enter symbols such as ☺ ♥ ⌂ █ α.
+Clicking a key types that character into the **previously focused** window. The keyboard itself does not steal focus, so you can keep Notepad, a browser, or a terminal focused and use this tool to enter symbols such as ☺ ♥ ⌂ █ α, or 速成 characters such as 嘅 唔 係.
 
 點擊按鍵會把該字元輸入到**先前聚焦**的視窗。鍵盤本身不會搶走焦點。
 
 ## Features
 
 - Native Win32 GUI (Rust + [`windows`](https://crates.io/crates/windows) crate). No webview, no admin rights, no telemetry, no hooks.
+- Two modes, switched from a segmented control on the **bottom bar** (`CP437｜速成`). The window title shows the current mode. The app **always opens in CP437**; the last mode is not remembered.
 - All **255** CP437 glyphs (codes 1..=255). Code 32 is a normal space (`空格`); code 255 is a non-breaking space U+00A0 (`不換行空格`).
-- Resizable window: the 16×16 key grid scales with the window.
-- Always on top (`WS_EX_TOPMOST`) and non-activating (`WS_EX_NOACTIVATE` + `WM_MOUSEACTIVATE` / `MA_NOACTIVATE`).
-- Types the actual Unicode glyph with `SendInput` and `KEYEVENTF_UNICODE` (not a simulated Alt+numpad sequence).
-- Each key shows the glyph and the `Alt+n` code, so it also works as an Alt-code reference.
-- Fonts: Segoe UI Symbol for glyphs, Microsoft JhengHei for Chinese labels, Segoe UI for captions (all built into Windows).
+- **速成** mode: a standard Cangjie letter-to-radical keyboard (every key shows the radical and the letter), a top candidate bar of nine characters with paging, and 刪 / 清除 / 空格. Only first + last codes (not full Cangjie). Hong Kong characters share the same candidate bar. Common spoken-Cantonese characters are promoted earlier in their lists. Candidate order is **not** claimed to match Microsoft 速成.
+- **符號** button (速成 layout only): opens the publicly documented Microsoft 倉頡 / 速成 Ctrl+Alt+, symbol keyboard (from 「┌」 through 「※」, plus the rest of that same official keyboard). Clicking a symbol uses `SendInput`. The physical Ctrl+Alt+, shortcut is not implemented. See [Sources](#sources).
+- Mouse / on-screen keyboard only. No focus steal (`WS_EX_NOACTIVATE` + `WM_MOUSEACTIVATE` / `MA_NOACTIVATE`) and no hooks. Physical 1–9 / Space are not handled.
+- First launch (no saved size) opens at the compact CP437 client size **480×460**, matching the measured reference screenshot (the PNG is 495×510 including a teal desktop margin; the window itself is about 482×492 with a 31 px title bar; the client area is exactly 480×460). The bottom status bar stays visible (~28 px). This is the actual default open size, not only a minimum the user has to drag down to. After you resize, the last **window size** (client area, and position when available) is remembered in `%APPDATA%\on99KB\window.ini`. Mode is not saved. Switching into 速成 reserves extra client height only for the top candidate row and grows the window just enough, without activating it, if the current height would clip the candidate bar or the bottom bar.
+- Always on top (`WS_EX_TOPMOST`) and a tool window.
+- Types the actual Unicode glyph with `SendInput` and `KEYEVENTF_UNICODE` (including non-BMP characters; not a simulated Alt+numpad sequence).
+- In CP437, each key shows the glyph and the `Alt+n` code when there is room (captions hide when the key is shorter than 30 px, as on the compact default window). Tight truncation of long labels (for example `on...`, `不...`) is expected at that size.
+- Fonts: Segoe UI Symbol for CP437 glyphs, Microsoft JhengHei for Chinese labels, Segoe UI for Latin captions. 速成 candidates use Microsoft JhengHei, then MingLiU_HKSCS, then MingLiU_HKSCS-ExtB, so rare HKSCS / Ext-B glyphs are less likely to tofu.
+- Application icon (from `assets/icon.png`) is embedded in the exe and used for the window.
 
 ## Run the exe
 
 Download `on99KB.exe` from the [Releases](https://github.com/TimothyLam1017/on99KB/releases) page, or build it yourself.
 
-1. Double-click `on99KB.exe`. A small tool window stays on top.
+1. Double-click `on99KB.exe`. A compact tool window stays on top, in CP437 mode.
 2. Click the window you want to type into (Notepad, a browser, a terminal, …) so it has focus.
 3. Click a key on on99KB. The character is inserted into that focused window.
-4. Drag any window edge or corner to resize the keyboard; the keys scale automatically.
-5. Close it with the window’s close button.
+4. Use `CP437｜速成` on the bottom bar to switch mode. In 速成, click radicals (at most two codes), then a candidate or 空格 to commit. 符號 opens the Ctrl+Alt+, symbol keyboard.
+5. Drag any window edge or corner to resize; the keys scale automatically. The last size is restored the next time you open the app.
+6. Close it with the window’s close button.
 
-The first grid cell (`on99KB`) is a label only and does not type anything.
+The first CP437 grid cell (`on99KB`) is a label only and does not type anything.
 
 ## Build on Windows
 
@@ -43,7 +49,7 @@ The exe is `target\release\on99KB.exe`.
 
 ## Cross-compile from Linux
 
-Requirements: Rust stable, the `x86_64-pc-windows-gnu` target, and MinGW-w64.
+Requirements: Rust stable, the `x86_64-pc-windows-gnu` target, and MinGW-w64 (including `x86_64-w64-mingw32-windres` for the icon resource).
 
 ```bash
 rustup default stable
@@ -59,11 +65,11 @@ cargo build --release --target x86_64-pc-windows-gnu
 
 The exe is `target/x86_64-pc-windows-gnu/release/on99KB.exe`.
 
-This repository’s `.cargo/config.toml` points the GNU target at `x86_64-w64-mingw32-gcc` and passes `-static` so the exe does not depend on MinGW runtime DLLs (`libgcc_s_seh-1.dll`, `libwinpthread-1.dll`, and so on).
+This repository’s `.cargo/config.toml` points the GNU target at `x86_64-w64-mingw32-gcc` and passes `-static` so the exe does not depend on MinGW runtime DLLs (`libgcc_s_seh-1.dll`, `libwinpthread-1.dll`, and so on). `build.rs` invokes `x86_64-w64-mingw32-windres` to embed `assets/icon.ico`.
 
-## Character set
+## Character set (CP437)
 
-The layout is a 16×16 grid (256 cells). Cell 0 is a title cell. Cells 1–255 are CP437:
+The CP437 layout is a 16×16 grid (256 cells). Cell 0 is a title cell. Cells 1–255 are CP437:
 
 | Code | Character | Notes |
 |------|-----------|--------|
@@ -78,12 +84,30 @@ The layout is a 16×16 grid (256 cells). Cell 0 is a title cell. Cells 1–255 a
 
 The mapping is covered by unit tests against the full requested list (`cargo test --lib`).
 
-## Limits
+## Sources
 
-- **Elevated / administrator apps:** Windows integrity rules (UIPI) block `SendInput` from a medium-integrity process into a higher-integrity window. If the target is running as administrator, run on99KB elevated too, or type into a non-elevated window.
-- Some games or apps that use raw input / exclusive keyboard capture may ignore Unicode `SendInput`.
-- Glyph appearance depends on the fonts installed on the PC. Windows includes Segoe UI Symbol, which covers these CP437 characters.
+The 速成 codebook is compiled into the exe. You do not need to keep any data file beside `on99KB.exe`. Full URLs, revisions, checksums, and merge rules are in [`data/SOURCES.md`](data/SOURCES.md).
 
-## License
+- **OpenVanilla `simplex-ext.cin`** (簡易／大字集, MIT DataTables / OpenVanilla MIT Licence), last changed in commit `69aa216a2429d1bffa8533666bd8d2ce07a34d6f` (2012-08-03):  
+  https://github.com/openvanilla/openvanilla/blob/69aa216a2429d1bffa8533666bd8d2ce07a34d6f/DataTables/simplex-ext.cin  
+  Licence text: [`data/LICENSE-OpenVanilla.txt`](data/LICENSE-OpenVanilla.txt).
+- **HKSCS-2016** public JSON from the Digital Policy Office:  
+  https://www.digitalpolicy.gov.hk/open_data/ccli/HKSCS2016.json  
+  Catalogue: https://data.gov.hk/en-data/dataset/hk-dpo-dpo_hp-hong-kong-supplementary-character-set-related-information  
+  Terms: https://data.gov.hk/en/terms-and-conditions  
 
-[MIT](LICENSE) © 2026 Timothy Lam
+  This project cites that source and acknowledges the intellectual property of the Government of the Hong Kong Special Administrative Region in the dataset. See [`data/HKSCS-ATTRIBUTION.md`](data/HKSCS-ATTRIBUTION.md). This is attribution, not legal advice.
+
+Merge rule: start from `simplex-ext.cin` order; add any HKSCS-2016 character that has a Cangjie code and is still missing, under the 速成 key of that official code (first + last letters). Codes are not invented. Common spoken-Cantonese characters already in the table are moved earlier in their lists; the documented list is `PROMOTED_CANTONESE` in `src/simplex.rs`.
+
+The 符號 keyboard follows Microsoft’s documented Ctrl+Alt+comma shortcut for 微軟倉頡 / 微軟速成 (a 符號鍵盤 / 輸入法整合器, not a private IME dictionary):
+
+- https://support.microsoft.com/zh-tw/windows/hardware/input-devices/microsoft-traditional-chinese-ime
+- Key maps: https://rakutentw.pixnet.net/blog/posts/11404319206 (2019, primary) and https://water0622.pixnet.net/blog/posts/4043845348 (2017). Key 7 is ’ (the 2017 ˙ looks like a typo); key D is ┘ (the 2017 table skips D). See `data/SOURCES.md`.
+
+## Known limitations
+
+- Mouse only: physical 1–9, Space, and Ctrl+Alt+, are not handled.
+- 速成 candidate order does not match Microsoft 速成, and is not claimed to.
+- v1 does not implement full Cangjie, association words (聯想詞), writing back into a folder, or IME hooks.
+- `SendInput` is still subject to User Interface Privilege Isolation (UIPI): this tool cannot type into a window that is running at a higher integrity level (for example an elevated Administrator window) unless on99KB is also elevated.

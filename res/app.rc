@@ -1,0 +1,2 @@
+// Icon resource compiled with x86_64-w64-mingw32-windres when targeting Windows GNU.
+1 ICON "assets/icon.ico"
