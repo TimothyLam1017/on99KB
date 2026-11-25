@@ -40,22 +40,24 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GetClientRect, GetCursorPos, GetMessageW, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect,
     IsIconic, KillTimer, LoadCursorW, LoadImageW, MessageBoxW, MoveWindow, PostQuitMessage,
-    RegisterClassExW, SetCursor, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW,
-    ShowWindow, TranslateMessage, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA,
-    HICON, HWND_TOPMOST, IDC_ARROW, IDC_HAND, IMAGE_ICON, LR_DEFAULTCOLOR, LR_DEFAULTSIZE,
-    MA_NOACTIVATE, MB_ICONERROR, MB_OK, MINMAXINFO, MSG, SM_CXSMICON, SM_CXVIRTUALSCREEN,
-    SM_CYSMICON, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SW_SHOWNOACTIVATE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_DESTROY,
-    WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE,
-    WM_MOUSEMOVE, WM_PAINT, WM_SETCURSOR, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_CAPTION,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
-    WS_THICKFRAME,
+    RegisterClassExW, SetCursor, SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW,
+    SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW,
+    CW_USEDEFAULT, GWLP_USERDATA, HICON, HWND_TOPMOST, IDC_ARROW, IDC_HAND, IMAGE_ICON,
+    LR_DEFAULTCOLOR, LR_DEFAULTSIZE, LWA_ALPHA, MA_NOACTIVATE, MB_ICONERROR, MB_OK, MINMAXINFO,
+    MSG, SM_CXSMICON, SM_CXVIRTUALSCREEN, SM_CYSMICON, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_SHOWNOACTIVATE, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT,
+    WM_SETCURSOR, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
 };
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const SIZE_MINIMIZED: u32 = 1;
 const SAVE_TIMER_ID: usize = 1;
 const SAVE_DEBOUNCE_MS: u32 = 400;
+const LATIN_HOLD_TIMER_ID: usize = 2;
+const LATIN_HOLD_MS: u32 = 350;
 
 const COLS: i32 = 16;
 const ROWS: i32 = 16;
@@ -63,6 +65,7 @@ const GRID_PAD: i32 = 8;
 const KEY_GAP: i32 = 3;
 const CANDIDATE_ROW_H: i32 = 48;
 const MODE_SEG_W: i32 = 62;
+const OPACITY_BTN_W: i32 = 50;
 const ICON_RESOURCE_ID: u16 = 1;
 const AUX_ROW_H: i32 = 28;
 const LETTER_ROW_MIN_H: i32 = 46;
@@ -83,7 +86,7 @@ const ENGLISH_ROWS: [&[char]; 3] = [
 const APP_STYLE: WINDOW_STYLE =
     WINDOW_STYLE(WS_POPUP.0 | WS_CAPTION.0 | WS_SYSMENU.0 | WS_THICKFRAME.0 | WS_MINIMIZEBOX.0);
 const APP_EX_STYLE: WINDOW_EX_STYLE =
-    WINDOW_EX_STYLE(WS_EX_NOACTIVATE.0 | WS_EX_TOPMOST.0 | WS_EX_TOOLWINDOW.0);
+    WINDOW_EX_STYLE(WS_EX_NOACTIVATE.0 | WS_EX_TOPMOST.0 | WS_EX_TOOLWINDOW.0 | WS_EX_LAYERED.0);
 
 fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
     COLORREF(u32::from(r) | (u32::from(g) << 8) | (u32::from(b) << 16))
@@ -148,6 +151,8 @@ enum Hit {
     Nav(NavKey),
     Backspace,
     Latin(char),
+    Opacity,
+    Brand,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -252,6 +257,8 @@ struct AppState {
     pressed: Option<Hit>,
     last_typed_cp437: Option<u8>,
     last_typed: Option<char>,
+    opacity: prefs::Opacity,
+    latin_shifted: bool,
     tracking: bool,
     fonts: Fonts,
     brushes: Brushes,
@@ -270,6 +277,8 @@ impl AppState {
                 pressed: None,
                 last_typed_cp437: None,
                 last_typed: None,
+                opacity: prefs::Opacity::DEFAULT,
+                latin_shifted: false,
                 tracking: false,
                 fonts: Fonts::empty(),
                 brushes: Brushes {
@@ -331,10 +340,24 @@ impl AppState {
         }
     }
 
+    fn opacity_rect(client: RECT) -> RECT {
+        let status = Self::status_rect(client);
+        let y0 = status.top + 3;
+        let y1 = status.bottom - 3;
+        let x0 = status.left + 8 + MODE_SEG_W * 2 + 8;
+        RECT {
+            left: x0,
+            top: y0,
+            right: x0 + OPACITY_BTN_W,
+            bottom: y1,
+        }
+    }
+
     fn hint_rect(client: RECT) -> RECT {
         let status = Self::status_rect(client);
+        let opacity = Self::opacity_rect(client);
         RECT {
-            left: status.left + 8 + MODE_SEG_W * 2 + 10,
+            left: opacity.right + 8,
             top: status.top,
             right: status.right - 12,
             bottom: status.bottom,
@@ -390,11 +413,12 @@ impl AppState {
     }
 }
 
-fn candidate_parts(client: RECT) -> (RECT, [RECT; 9], RECT, RECT) {
+fn candidate_parts(client: RECT) -> (RECT, RECT, [RECT; 9], RECT, RECT) {
     let band = AppState::candidate_band(client);
     let narrow = band.right - band.left < 430;
     let page_w = if narrow { 28 } else { 36 };
     let codes_w = if narrow { 78 } else { 100 };
+    let brand_w = if narrow { 52 } else { 58 };
     let gap = if narrow { 2 } else { 3 };
     let next = RECT {
         left: band.right - page_w,
@@ -408,10 +432,16 @@ fn candidate_parts(client: RECT) -> (RECT, [RECT; 9], RECT, RECT) {
         right: next.left - gap,
         bottom: band.bottom,
     };
-    let codes = RECT {
+    let brand = RECT {
         left: band.left,
         top: band.top,
-        right: band.left + codes_w,
+        right: band.left + brand_w,
+        bottom: band.bottom,
+    };
+    let codes = RECT {
+        left: brand.right + gap,
+        top: band.top,
+        right: brand.right + gap + codes_w,
         bottom: band.bottom,
     };
     let slots_left = codes.right + gap;
@@ -428,7 +458,7 @@ fn candidate_parts(client: RECT) -> (RECT, [RECT; 9], RECT, RECT) {
             bottom: band.bottom,
         };
     }
-    (codes, slots, prev, next)
+    (brand, codes, slots, prev, next)
 }
 
 fn centered_keys(row: RECT, count: i32, key_w: i32) -> Vec<RECT> {
@@ -674,9 +704,15 @@ impl AppState {
                 return Some(Hit::Mode(m));
             }
         }
+        if pt_in(AppState::opacity_rect(client), x, y) {
+            return Some(Hit::Opacity);
+        }
         if self.mode == Mode::Simplex {
-            let (codes, slots, prev, next) = candidate_parts(client);
+            let (brand, codes, slots, prev, next) = candidate_parts(client);
             let _ = codes;
+            if pt_in(brand, x, y) {
+                return Some(Hit::Brand);
+            }
             if pt_in(prev, x, y) {
                 return Some(Hit::PagePrev);
             }
@@ -919,7 +955,10 @@ fn save_prefs(hwnd: HWND) {
     unsafe {
         let _ = GetWindowRect(hwnd, &mut wr);
     }
-    let Some(p) = prefs::sanitize(w, h, Some(wr.left), Some(wr.top)) else {
+    let opacity = state_mut(hwnd)
+        .map(|s| s.opacity)
+        .unwrap_or(prefs::Opacity::DEFAULT);
+    let Some(p) = prefs::sanitize(w, h, Some(wr.left), Some(wr.top), opacity) else {
         return;
     };
     let Some(path) = prefs_path() else {
@@ -951,6 +990,43 @@ fn clamp_window_pos(x: i32, y: i32, win_w: i32, win_h: i32) -> (i32, i32) {
         let ny = y.clamp(vy, vy + vh - 40);
         let _ = win_h;
         (nx, ny)
+    }
+}
+
+fn apply_opacity(hwnd: HWND, opacity: prefs::Opacity) {
+    unsafe {
+        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), opacity.alpha(), LWA_ALPHA);
+    }
+}
+
+fn kill_latin_timer(hwnd: HWND) {
+    unsafe {
+        let _ = KillTimer(hwnd, LATIN_HOLD_TIMER_ID);
+    }
+}
+
+fn cursor_in_client(hwnd: HWND) -> (i32, i32) {
+    let mut pt = POINT::default();
+    unsafe {
+        let _ = GetCursorPos(&mut pt);
+        let _ = ScreenToClient(hwnd, &mut pt);
+    }
+    (pt.x, pt.y)
+}
+
+fn wheel_delta(wparam: WPARAM) -> i16 {
+    ((wparam.0 as u32) >> 16) as u16 as i16
+}
+
+fn simplex_page_prev(state: &mut AppState) {
+    if !state.symbols_open && simplex::can_page_prev(state.page) {
+        state.page -= 1;
+    }
+}
+
+fn simplex_page_next(state: &mut AppState) {
+    if !state.symbols_open && simplex::can_page_next(state.current_candidates().len(), state.page) {
+        state.page += 1;
     }
 }
 
@@ -1000,7 +1076,7 @@ fn commit_char(state: &mut AppState, ch: char) {
 
 fn activate_hit(hwnd: HWND, state: &mut AppState, hit: Hit) {
     match hit {
-        Hit::Cp437(0) => {}
+        Hit::Cp437(0) | Hit::Brand => {}
         Hit::Cp437(32) => {
             // The Alt+32 cell is labelled BS and sends Backspace, not a space.
             let _ = send_vk(VK_BACK, false);
@@ -1020,6 +1096,8 @@ fn activate_hit(hwnd: HWND, state: &mut AppState, hit: Hit) {
                 state.codes.clear();
                 state.page = 0;
                 state.hover = None;
+                state.latin_shifted = false;
+                kill_latin_timer(hwnd);
                 state.font_key = (0, 0, 0, 255);
                 set_title(hwnd, mode);
                 apply_mode_min_size(hwnd, state);
@@ -1053,18 +1131,8 @@ fn activate_hit(hwnd: HWND, state: &mut AppState, hit: Hit) {
                 }
             }
         }
-        Hit::PagePrev => {
-            if !state.symbols_open && simplex::can_page_prev(state.page) {
-                state.page -= 1;
-            }
-        }
-        Hit::PageNext => {
-            if !state.symbols_open
-                && simplex::can_page_next(state.current_candidates().len(), state.page)
-            {
-                state.page += 1;
-            }
-        }
+        Hit::PagePrev => simplex_page_prev(state),
+        Hit::PageNext => simplex_page_next(state),
         Hit::SymbolToggle => {
             state.symbols_open = !state.symbols_open;
             state.page = 0;
@@ -1074,15 +1142,24 @@ fn activate_hit(hwnd: HWND, state: &mut AppState, hit: Hit) {
             let _ = send_unicode(ch);
             state.last_typed = Some(ch);
         }
-        Hit::Digit(ch) | Hit::Punct(ch) | Hit::Latin(ch) => {
+        Hit::Digit(ch) | Hit::Punct(ch) => {
             let _ = send_unicode(ch);
             state.last_typed = Some(ch);
+        }
+        Hit::Latin(_) => {
+            // English letters are committed from the press / hold timer path
+            // so a short press cannot type lowercase and then uppercase.
         }
         Hit::Nav(nav) => {
             let _ = send_vk(nav.vk(), true);
         }
         Hit::Backspace => {
             let _ = send_vk(VK_BACK, false);
+        }
+        Hit::Opacity => {
+            state.opacity = state.opacity.next();
+            apply_opacity(hwnd, state.opacity);
+            schedule_save(hwnd);
         }
     }
 }
@@ -1193,8 +1270,13 @@ pub fn run() -> WinResult<()> {
             None,
         )?;
 
-        let boxed = Box::new(AppState::new()?);
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(boxed) as isize);
+        let mut state = AppState::new()?;
+        if let Some(p) = saved.as_ref() {
+            state.opacity = p.opacity;
+        }
+        let opacity = state.opacity;
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(Box::new(state)) as isize);
+        apply_opacity(hwnd, opacity);
 
         let _ = SetWindowPos(
             hwnd,
@@ -1277,6 +1359,37 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if wparam.0 == SAVE_TIMER_ID {
                 let _ = KillTimer(hwnd, SAVE_TIMER_ID);
                 save_prefs(hwnd);
+            } else if wparam.0 == LATIN_HOLD_TIMER_ID {
+                kill_latin_timer(hwnd);
+                if let Some(state) = state_mut(hwnd) {
+                    if let Some(Hit::Latin(ch)) = state.pressed {
+                        if !state.latin_shifted {
+                            let rc = client_rect(hwnd);
+                            let (x, y) = cursor_in_client(hwnd);
+                            if state.hit_test(rc, x, y) == Some(Hit::Latin(ch)) {
+                                let upper = ch.to_ascii_uppercase();
+                                let _ = send_unicode(upper);
+                                state.last_typed = Some(upper);
+                                state.latin_shifted = true;
+                            }
+                        }
+                    }
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_MOUSEWHEEL => {
+            if let Some(state) = state_mut(hwnd) {
+                if state.mode == Mode::Simplex {
+                    let delta = wheel_delta(wparam);
+                    if delta > 0 {
+                        simplex_page_prev(state);
+                    } else if delta < 0 {
+                        simplex_page_next(state);
+                    }
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
             }
             LRESULT(0)
         }
@@ -1328,7 +1441,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let (x, y) = point_from_lparam(lparam);
             let rc = client_rect(hwnd);
             if let Some(state) = state_mut(hwnd) {
+                kill_latin_timer(hwnd);
+                state.latin_shifted = false;
                 state.pressed = state.hit_test(rc, x, y);
+                if let Some(Hit::Latin(_)) = state.pressed {
+                    let _ = SetTimer(hwnd, LATIN_HOLD_TIMER_ID, LATIN_HOLD_MS, None);
+                }
                 let _ = InvalidateRect(hwnd, None, false);
             }
             let _ = SetCapture(hwnd);
@@ -1336,15 +1454,29 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_LBUTTONUP => {
             let _ = ReleaseCapture();
+            kill_latin_timer(hwnd);
             let (x, y) = point_from_lparam(lparam);
             let rc = client_rect(hwnd);
             if let Some(state) = state_mut(hwnd) {
                 let pressed = state.pressed.take();
+                let already_shifted = state.latin_shifted;
+                state.latin_shifted = false;
                 let hit = state.hit_test(rc, x, y);
-                if let (Some(p), Some(c)) = (pressed, hit) {
-                    if p == c {
-                        activate_hit(hwnd, state, c);
+                match pressed {
+                    Some(Hit::Latin(_)) if already_shifted => {
+                        // Uppercase was sent when the hold timer fired.
                     }
+                    Some(Hit::Latin(ch)) if hit == Some(Hit::Latin(ch)) => {
+                        let _ = send_unicode(ch);
+                        state.last_typed = Some(ch);
+                    }
+                    Some(Hit::Latin(_)) => {
+                        // Released off the key before the hold threshold: type nothing.
+                    }
+                    Some(p) if hit == Some(p) => {
+                        activate_hit(hwnd, state, p);
+                    }
+                    _ => {}
                 }
                 let _ = InvalidateRect(hwnd, None, false);
             }
@@ -1356,12 +1488,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_CLOSE => {
             let _ = KillTimer(hwnd, SAVE_TIMER_ID);
+            kill_latin_timer(hwnd);
             save_prefs(hwnd);
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
         }
         WM_DESTROY => {
             let _ = KillTimer(hwnd, SAVE_TIMER_ID);
+            kill_latin_timer(hwnd);
             save_prefs(hwnd);
             let p = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             if p != 0 {
@@ -1515,6 +1649,7 @@ unsafe fn paint(hwnd: HWND) {
         }
 
         draw_mode_switch(mem, state, rc);
+        draw_opacity_btn(mem, state, rc);
         draw_hint(mem, state, rc);
 
         SelectObject(mem, old_pen);
@@ -1567,6 +1702,36 @@ unsafe fn draw_mode_switch(hdc: HDC, state: &AppState, client: RECT) {
     }
 }
 
+unsafe fn draw_opacity_btn(hdc: HDC, state: &AppState, client: RECT) {
+    let rc = AppState::opacity_rect(client);
+    let hit = Hit::Opacity;
+    let brush = if state.pressed == Some(hit) {
+        state.brushes.pressed
+    } else if state.hover == Some(hit) {
+        state.brushes.hover
+    } else {
+        state.brushes.special
+    };
+    let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
+    let _ = RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, 6, 6);
+    SelectObject(hdc, old_brush);
+    let _ = SelectObject(hdc, HGDIOBJ(state.fonts.status.0));
+    SetTextColor(hdc, rgb(0xF4, 0xF5, 0xF8));
+    let mut text: Vec<u16> = state.opacity.label().encode_utf16().collect();
+    let mut text_rc = RECT {
+        left: rc.left + 1,
+        top: rc.top,
+        right: rc.right - 1,
+        bottom: rc.bottom,
+    };
+    DrawTextW(
+        hdc,
+        &mut text,
+        &mut text_rc,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+    );
+}
+
 unsafe fn draw_hint(hdc: HDC, state: &AppState, client: RECT) {
     let hint = hint_text(state);
     let mut hint_rc = AppState::hint_rect(client);
@@ -1582,6 +1747,12 @@ unsafe fn draw_hint(hdc: HDC, state: &AppState, client: RECT) {
 }
 
 fn hint_text(state: &AppState) -> String {
+    if matches!(state.hover, Some(Hit::Opacity)) {
+        return format!(
+            "透明度  ·  {}  ·  點擊切換 100% / 50% / 25%（100% 為完全不透明）",
+            state.opacity.label()
+        );
+    }
     match state.mode {
         Mode::Cp437 => {
             if let Some(code) = match state.hover {
@@ -1622,8 +1793,9 @@ fn hint_text(state: &AppState) -> String {
                 )
             }
             Some(Hit::Latin(ch)) => {
-                format!("英文  ·  {ch}  ·  輸入到先前聚焦視窗（唔係速成碼）")
+                format!("英文  ·  {ch}  ·  短按小寫、按住 {LATIN_HOLD_MS}ms 大寫（唔係速成碼）")
             }
+            Some(Hit::Brand) => "on99KB  ·  速成 螢幕鍵盤  ·  標籤，唔會輸入".to_string(),
             Some(Hit::Digit(ch)) | Some(Hit::Punct(ch)) => {
                 format!("點擊輸入  ·  {ch}  到先前聚焦視窗")
             }
@@ -1647,7 +1819,8 @@ fn hint_text(state: &AppState) -> String {
 }
 
 unsafe fn draw_simplex(hdc: HDC, state: &AppState, client: RECT) {
-    let (codes_rc, slots, prev, next) = candidate_parts(client);
+    let (brand_rc, codes_rc, slots, prev, next) = candidate_parts(client);
+    draw_brand_chip(hdc, state, brand_rc);
     // Codes / mode label in the candidate bar (so 符號 mode is obvious).
     let label = if state.symbols_open {
         "符號".to_string()
@@ -1823,6 +1996,39 @@ unsafe fn draw_page_btn(
     );
 }
 
+unsafe fn draw_brand_chip(hdc: HDC, state: &AppState, rc: RECT) {
+    if rc.right - rc.left < 4 || rc.bottom - rc.top < 4 {
+        return;
+    }
+    let hit = Hit::Brand;
+    let brush = if state.pressed == Some(hit) {
+        state.brushes.pressed
+    } else if state.hover == Some(hit) {
+        state.brushes.hover
+    } else {
+        state.brushes.special
+    };
+    let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
+    let radius = ((rc.bottom - rc.top).min(rc.right - rc.left) / 6).clamp(2, 8);
+    let _ = RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
+    SelectObject(hdc, old_brush);
+    let _ = SelectObject(hdc, HGDIOBJ(state.fonts.named.0));
+    SetTextColor(hdc, rgb(0x8E, 0xC8, 0xFF));
+    let mut text: Vec<u16> = "on99KB".encode_utf16().collect();
+    let mut text_rc = RECT {
+        left: rc.left + 1,
+        top: rc.top + 1,
+        right: rc.right - 1,
+        bottom: rc.bottom - 1,
+    };
+    DrawTextW(
+        hdc,
+        &mut text,
+        &mut text_rc,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+    );
+}
+
 unsafe fn draw_english_key(hdc: HDC, state: &AppState, rc: RECT, letter: char) {
     if rc.right - rc.left < 4 || rc.bottom - rc.top < 4 {
         return;
@@ -1839,9 +2045,22 @@ unsafe fn draw_english_key(hdc: HDC, state: &AppState, rc: RECT, letter: char) {
     let radius = ((rc.bottom - rc.top).min(rc.right - rc.left) / 6).clamp(2, 8);
     let _ = RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
     SelectObject(hdc, old_brush);
+    let shifted = state.latin_shifted && state.pressed == Some(Hit::Latin(letter));
+    let glyph = if shifted {
+        letter.to_ascii_uppercase()
+    } else {
+        letter
+    };
     let _ = SelectObject(hdc, HGDIOBJ(state.fonts.english.0));
-    SetTextColor(hdc, rgb(0xB8, 0xE4, 0xD8));
-    let mut text = utf16_char(letter);
+    SetTextColor(
+        hdc,
+        if shifted {
+            rgb(0xFF, 0xF4, 0xC8)
+        } else {
+            rgb(0xB8, 0xE4, 0xD8)
+        },
+    );
+    let mut text = utf16_char(glyph);
     let mut tr = RECT {
         left: rc.left + 1,
         top: rc.top,

@@ -1,4 +1,4 @@
-//! Remembered window size. Mode is never persisted.
+//! Remembered window size and opacity. Mode is never persisted.
 
 /// First-launch and minimum CP437 client size, in pixels.
 ///
@@ -12,15 +12,78 @@ pub const MIN_CLIENT_W: i32 = 480;
 pub const MIN_CLIENT_H: i32 = 460;
 pub const MAX_CLIENT: i32 = 10_000;
 
+/// Window visibility: 100% is fully opaque (the default), 50% and 25% are
+/// more transparent. These are percentages of opacity, not of transparency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Opacity {
+    P25,
+    P50,
+    P100,
+}
+
+impl Opacity {
+    pub const DEFAULT: Self = Self::P100;
+
+    pub fn from_percent(n: i32) -> Option<Self> {
+        match n {
+            25 => Some(Self::P25),
+            50 => Some(Self::P50),
+            100 => Some(Self::P100),
+            _ => None,
+        }
+    }
+
+    pub fn percent(self) -> u8 {
+        match self {
+            Self::P25 => 25,
+            Self::P50 => 50,
+            Self::P100 => 100,
+        }
+    }
+
+    /// Alpha value for `SetLayeredWindowAttributes` (`LWA_ALPHA`).
+    pub fn alpha(self) -> u8 {
+        match self {
+            Self::P25 => 64,
+            Self::P50 => 128,
+            Self::P100 => 255,
+        }
+    }
+
+    /// Cycle 100% → 50% → 25% → 100%.
+    pub fn next(self) -> Self {
+        match self {
+            Self::P100 => Self::P50,
+            Self::P50 => Self::P25,
+            Self::P25 => Self::P100,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::P25 => "25%",
+            Self::P50 => "50%",
+            Self::P100 => "100%",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowPrefs {
     pub width: i32,
     pub height: i32,
     pub x: Option<i32>,
     pub y: Option<i32>,
+    pub opacity: Opacity,
 }
 
-pub fn sanitize(width: i32, height: i32, x: Option<i32>, y: Option<i32>) -> Option<WindowPrefs> {
+pub fn sanitize(
+    width: i32,
+    height: i32,
+    x: Option<i32>,
+    y: Option<i32>,
+    opacity: Opacity,
+) -> Option<WindowPrefs> {
     if !(MIN_CLIENT_W..=MAX_CLIENT).contains(&width) {
         return None;
     }
@@ -32,16 +95,20 @@ pub fn sanitize(width: i32, height: i32, x: Option<i32>, y: Option<i32>) -> Opti
         height,
         x,
         y,
+        opacity,
     })
 }
 
-/// Parse a small `width=` / `height=` / optional `x=` / `y=` ini.
-/// Corrupt or out-of-range sizes yield `None` (caller uses the default).
+/// Parse a small `width=` / `height=` / optional `x=` / `y=` / optional
+/// `opacity=` ini. Corrupt or out-of-range sizes yield `None` (caller uses
+/// the default). A missing or invalid `opacity` falls back to 100% and does
+/// not discard a valid size.
 pub fn parse_window_ini(s: &str) -> Option<WindowPrefs> {
     let mut width = None;
     let mut height = None;
     let mut x = None;
     let mut y = None;
+    let mut opacity = Opacity::DEFAULT;
     for raw in s.lines() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
@@ -58,16 +125,23 @@ pub fn parse_window_ini(s: &str) -> Option<WindowPrefs> {
             "height" => height = Some(n),
             "x" => x = Some(n),
             "y" => y = Some(n),
+            "opacity" => {
+                if let Some(o) = Opacity::from_percent(n) {
+                    opacity = o;
+                }
+            }
             _ => {}
         }
     }
-    sanitize(width?, height?, x, y)
+    sanitize(width?, height?, x, y, opacity)
 }
 
 pub fn format_window_ini(prefs: &WindowPrefs) -> String {
     let mut s = format!(
-        "# on99KB window size (client area, pixels). Mode is not stored.\nwidth={}\nheight={}\n",
-        prefs.width, prefs.height
+        "# on99KB window size (client area, pixels) and opacity. Mode is not stored.\nwidth={}\nheight={}\nopacity={}\n",
+        prefs.width,
+        prefs.height,
+        prefs.opacity.percent()
     );
     if let (Some(x), Some(y)) = (prefs.x, prefs.y) {
         s.push_str(&format!("x={x}\ny={y}\n"));
@@ -94,8 +168,31 @@ mod tests {
         assert_eq!(p.height, 512);
         assert_eq!(p.x, Some(10));
         assert_eq!(p.y, Some(20));
+        assert_eq!(p.opacity, Opacity::DEFAULT);
         let again = parse_window_ini(&format_window_ini(&p)).unwrap();
         assert_eq!(p, again);
+        assert!(format_window_ini(&p).contains("opacity=100"));
+    }
+
+    #[test]
+    fn opacity_parses_and_falls_back() {
+        let p = parse_window_ini("width=480\nheight=460\nopacity=25\n").unwrap();
+        assert_eq!(p.opacity, Opacity::P25);
+        assert_eq!(p.opacity.alpha(), 64);
+        let p = parse_window_ini("width=480\nheight=460\nopacity=50\n").unwrap();
+        assert_eq!(p.opacity, Opacity::P50);
+        assert_eq!(p.opacity.alpha(), 128);
+        let p = parse_window_ini("width=480\nheight=460\nopacity=100\n").unwrap();
+        assert_eq!(p.opacity, Opacity::P100);
+        assert_eq!(p.opacity.alpha(), 255);
+        // invalid or missing opacity must not drop a valid size
+        let p = parse_window_ini("width=480\nheight=460\nopacity=40\n").unwrap();
+        assert_eq!(p.opacity, Opacity::P100);
+        let p = parse_window_ini("width=480\nheight=460\n").unwrap();
+        assert_eq!(p.opacity, Opacity::P100);
+        assert_eq!(Opacity::P100.next(), Opacity::P50);
+        assert_eq!(Opacity::P50.next(), Opacity::P25);
+        assert_eq!(Opacity::P25.next(), Opacity::P100);
     }
 
     #[test]
@@ -111,5 +208,6 @@ mod tests {
         assert_eq!(p.width, 480);
         assert_eq!(p.height, 460);
         assert_eq!(p.x, None);
+        assert_eq!(p.opacity, Opacity::P100);
     }
 }
