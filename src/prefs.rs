@@ -1,4 +1,4 @@
-//! Remembered window size, position, opacity, and always-on-top. Mode is never persisted.
+//! Remembered window size, position, opacity, always-on-top, and keyboard mode.
 
 /// First-launch and minimum CP437 client size, in pixels.
 ///
@@ -68,6 +68,32 @@ impl Opacity {
     }
 }
 
+/// Keyboard layout mode. Missing or invalid ini values default to CP437.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyboardMode {
+    Cp437,
+    Simplex,
+}
+
+impl KeyboardMode {
+    pub const DEFAULT: Self = Self::Cp437;
+
+    pub fn as_ini(self) -> &'static str {
+        match self {
+            Self::Cp437 => "cp437",
+            Self::Simplex => "simplex",
+        }
+    }
+
+    pub fn from_ini(s: &str) -> Option<Self> {
+        match s.trim() {
+            "cp437" => Some(Self::Cp437),
+            "simplex" => Some(Self::Simplex),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowPrefs {
     pub width: i32,
@@ -77,6 +103,7 @@ pub struct WindowPrefs {
     pub opacity: Opacity,
     /// Always-on-top. Missing or invalid ini values default to `true`.
     pub topmost: bool,
+    pub mode: KeyboardMode,
 }
 
 pub fn sanitize(
@@ -86,6 +113,7 @@ pub fn sanitize(
     y: Option<i32>,
     opacity: Opacity,
     topmost: bool,
+    mode: KeyboardMode,
 ) -> Option<WindowPrefs> {
     if !(MIN_CLIENT_W..=MAX_CLIENT).contains(&width) {
         return None;
@@ -100,14 +128,16 @@ pub fn sanitize(
         y,
         opacity,
         topmost,
+        mode,
     })
 }
 
 /// Parse a small `width=` / `height=` / optional `x=` / `y=` / optional
-/// `opacity=` / optional `topmost=` ini. Corrupt or out-of-range sizes yield
-/// `None` (caller uses the default). A missing or invalid `opacity` falls
-/// back to 100%, and a missing or invalid `topmost` falls back to on (1);
-/// neither discards a valid size.
+/// `opacity=` / optional `topmost=` / optional `mode=` ini. Corrupt or
+/// out-of-range sizes yield `None` (caller uses the default). A missing or
+/// invalid `opacity` falls back to 100%, a missing or invalid `topmost`
+/// falls back to on (1), and a missing or invalid `mode` falls back to
+/// CP437; none of these discard a valid size.
 pub fn parse_window_ini(s: &str) -> Option<WindowPrefs> {
     let mut width = None;
     let mut height = None;
@@ -115,6 +145,7 @@ pub fn parse_window_ini(s: &str) -> Option<WindowPrefs> {
     let mut y = None;
     let mut opacity = Opacity::DEFAULT;
     let mut topmost = true;
+    let mut mode = KeyboardMode::DEFAULT;
     for raw in s.lines() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
@@ -123,10 +154,18 @@ pub fn parse_window_ini(s: &str) -> Option<WindowPrefs> {
         let Some((k, v)) = line.split_once('=') else {
             continue;
         };
-        let Ok(n) = v.trim().parse::<i32>() else {
+        let key = k.trim();
+        let val = v.trim();
+        if key == "mode" {
+            if let Some(m) = KeyboardMode::from_ini(val) {
+                mode = m;
+            }
+            continue;
+        }
+        let Ok(n) = val.parse::<i32>() else {
             continue;
         };
-        match k.trim() {
+        match key {
             "width" => width = Some(n),
             "height" => height = Some(n),
             "x" => x = Some(n),
@@ -144,16 +183,17 @@ pub fn parse_window_ini(s: &str) -> Option<WindowPrefs> {
             _ => {}
         }
     }
-    sanitize(width?, height?, x, y, opacity, topmost)
+    sanitize(width?, height?, x, y, opacity, topmost, mode)
 }
 
 pub fn format_window_ini(prefs: &WindowPrefs) -> String {
     let mut s = format!(
-        "# on99KB window size (client area, pixels), opacity, and always-on-top. Mode is not stored.\nwidth={}\nheight={}\nopacity={}\ntopmost={}\n",
+        "# on99KB window size (client area, pixels), opacity, always-on-top, and mode.\nwidth={}\nheight={}\nopacity={}\ntopmost={}\nmode={}\n",
         prefs.width,
         prefs.height,
         prefs.opacity.percent(),
-        if prefs.topmost { 1 } else { 0 }
+        if prefs.topmost { 1 } else { 0 },
+        prefs.mode.as_ini()
     );
     if let (Some(x), Some(y)) = (prefs.x, prefs.y) {
         s.push_str(&format!("x={x}\ny={y}\n"));
@@ -182,11 +222,13 @@ mod tests {
         assert_eq!(p.y, Some(20));
         assert_eq!(p.opacity, Opacity::DEFAULT);
         assert!(p.topmost);
+        assert_eq!(p.mode, KeyboardMode::DEFAULT);
         let again = parse_window_ini(&format_window_ini(&p)).unwrap();
         assert_eq!(p, again);
         let formatted = format_window_ini(&p);
         assert!(formatted.contains("opacity=100"));
         assert!(formatted.contains("topmost=1"));
+        assert!(formatted.contains("mode=cp437"));
     }
 
     #[test]
@@ -222,12 +264,49 @@ mod tests {
         assert!(p.topmost);
         let p = parse_window_ini("width=480\nheight=460\n").unwrap();
         assert!(p.topmost);
-        let off = sanitize(480, 460, Some(10), Some(20), Opacity::P50, false).unwrap();
+        let off = sanitize(
+            480,
+            460,
+            Some(10),
+            Some(20),
+            Opacity::P50,
+            false,
+            KeyboardMode::Cp437,
+        )
+        .unwrap();
         let text = format_window_ini(&off);
         assert!(text.contains("topmost=0"));
         assert!(text.contains("opacity=50"));
         let again = parse_window_ini(&text).unwrap();
         assert_eq!(off, again);
+    }
+
+    #[test]
+    fn mode_parses_and_falls_back() {
+        let p = parse_window_ini("width=480\nheight=460\nmode=simplex\n").unwrap();
+        assert_eq!(p.mode, KeyboardMode::Simplex);
+        assert_eq!(p.width, 480);
+        let p = parse_window_ini("width=480\nheight=460\nmode=cp437\n").unwrap();
+        assert_eq!(p.mode, KeyboardMode::Cp437);
+        // invalid or missing mode must not drop a valid size, and defaults to CP437
+        let p = parse_window_ini("width=480\nheight=460\nmode=fullcangjie\n").unwrap();
+        assert_eq!(p.mode, KeyboardMode::Cp437);
+        let p = parse_window_ini("width=480\nheight=460\n").unwrap();
+        assert_eq!(p.mode, KeyboardMode::Cp437);
+        let stored = sanitize(
+            480,
+            460,
+            Some(10),
+            Some(20),
+            Opacity::P100,
+            true,
+            KeyboardMode::Simplex,
+        )
+        .unwrap();
+        let text = format_window_ini(&stored);
+        assert!(text.contains("mode=simplex"));
+        let again = parse_window_ini(&text).unwrap();
+        assert_eq!(stored, again);
     }
 
     #[test]
@@ -245,5 +324,6 @@ mod tests {
         assert_eq!(p.x, None);
         assert_eq!(p.opacity, Opacity::P100);
         assert!(p.topmost);
+        assert_eq!(p.mode, KeyboardMode::Cp437);
     }
 }

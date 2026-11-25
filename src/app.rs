@@ -9,7 +9,7 @@
 //! fits, and otherwise grows just enough (SWP_NOACTIVATE) for the candidate
 //! bar, auxiliary rows, a readable radical keyboard, a lowercase English
 //! QWERTY band, a compact action row, and the status bar. Last window size
-//! is remembered; mode is not.
+//! and keyboard mode are remembered.
 
 #![cfg(windows)]
 
@@ -68,6 +68,9 @@ const KEY_GAP: i32 = 3;
 const CANDIDATE_ROW_H: i32 = 48;
 const MODE_SEG_W: i32 = 62;
 const OPACITY_BTN_W: i32 = 50;
+const SPACE_BAR_MIN_W: i32 = 96;
+const SPACE_BAR_MAX_W: i32 = 280;
+const HINT_RESERVE_W: i32 = 88;
 const ICON_RESOURCE_ID: u16 = 1;
 const AUX_ROW_H: i32 = 28;
 const LETTER_ROW_MIN_H: i32 = 46;
@@ -143,6 +146,25 @@ fn title_for(mode: Mode) -> &'static str {
     }
 }
 
+fn mode_from_prefs(mode: prefs::KeyboardMode) -> Mode {
+    match mode {
+        prefs::KeyboardMode::Cp437 => Mode::Cp437,
+        prefs::KeyboardMode::Simplex => Mode::Simplex,
+    }
+}
+
+fn mode_to_prefs(mode: Mode) -> prefs::KeyboardMode {
+    match mode {
+        Mode::Cp437 => prefs::KeyboardMode::Cp437,
+        Mode::Simplex => prefs::KeyboardMode::Simplex,
+    }
+}
+
+fn has_simplex_composition(state: &AppState) -> bool {
+    state.mode == Mode::Simplex
+        && (!state.codes.is_empty() || !state.current_candidates().is_empty())
+}
+
 fn make_int_resource(id: u16) -> PCWSTR {
     PCWSTR(id as usize as *const u16)
 }
@@ -173,6 +195,7 @@ enum Hit {
     Latin(char),
     Opacity,
     Brand,
+    AsciiSpace,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -375,11 +398,27 @@ impl AppState {
         }
     }
 
+    fn space_bar_rect(client: RECT) -> RECT {
+        let status = Self::status_rect(client);
+        let y0 = status.top + 3;
+        let y1 = status.bottom - 3;
+        let x0 = Self::opacity_rect(client).right + 8;
+        let hint_and_margin = 12 + HINT_RESERVE_W + 8;
+        let avail = (status.right - hint_and_margin - x0).max(SPACE_BAR_MIN_W);
+        let space_w = avail.clamp(SPACE_BAR_MIN_W, SPACE_BAR_MAX_W);
+        RECT {
+            left: x0,
+            top: y0,
+            right: x0 + space_w,
+            bottom: y1,
+        }
+    }
+
     fn hint_rect(client: RECT) -> RECT {
         let status = Self::status_rect(client);
-        let opacity = Self::opacity_rect(client);
+        let space = Self::space_bar_rect(client);
         RECT {
-            left: opacity.right + 8,
+            left: space.right + 8,
             top: status.top,
             right: status.right - 12,
             bottom: status.bottom,
@@ -729,6 +768,9 @@ impl AppState {
         if pt_in(AppState::opacity_rect(client), x, y) {
             return Some(Hit::Opacity);
         }
+        if pt_in(AppState::space_bar_rect(client), x, y) {
+            return Some(Hit::AsciiSpace);
+        }
         if self.mode == Mode::Simplex {
             let (brand, codes, slots, prev, next) = candidate_parts(client);
             let _ = codes;
@@ -977,10 +1019,10 @@ fn save_prefs(hwnd: HWND) {
     unsafe {
         let _ = GetWindowRect(hwnd, &mut wr);
     }
-    let (opacity, topmost) = state_mut(hwnd)
-        .map(|s| (s.opacity, s.topmost))
-        .unwrap_or((prefs::Opacity::DEFAULT, true));
-    let Some(p) = prefs::sanitize(w, h, Some(wr.left), Some(wr.top), opacity, topmost) else {
+    let (opacity, topmost, mode) = state_mut(hwnd)
+        .map(|s| (s.opacity, s.topmost, mode_to_prefs(s.mode)))
+        .unwrap_or((prefs::Opacity::DEFAULT, true, prefs::KeyboardMode::DEFAULT));
+    let Some(p) = prefs::sanitize(w, h, Some(wr.left), Some(wr.top), opacity, topmost, mode) else {
         return;
     };
     let Some(path) = prefs_path() else {
@@ -1154,6 +1196,7 @@ fn activate_hit(hwnd: HWND, state: &mut AppState, hit: Hit) {
                 state.font_key = (0, 0, 0, 255);
                 set_title(hwnd, mode);
                 apply_mode_min_size(hwnd, state);
+                save_prefs(hwnd);
             }
         }
         Hit::Letter(ch) => {
@@ -1207,7 +1250,16 @@ fn activate_hit(hwnd: HWND, state: &mut AppState, hit: Hit) {
             let _ = send_vk(nav.vk(), true);
         }
         Hit::Backspace => {
-            let _ = send_vk(VK_BACK, false);
+            if has_simplex_composition(state) {
+                state.codes.clear();
+                state.page = 0;
+            } else {
+                let _ = send_vk(VK_BACK, false);
+            }
+        }
+        Hit::AsciiSpace => {
+            let _ = send_unicode(' ');
+            state.last_typed = Some(' ');
         }
         Hit::Opacity => {
             state.opacity = state.opacity.next();
@@ -1282,7 +1334,8 @@ pub fn run() -> WinResult<()> {
 
         let saved = load_prefs();
         // First launch (no saved size): the screenshot-measured 480×460 client,
-        // never the old 900×820 default. Mode always starts as CP437.
+        // never the old 900×820 default. Missing or invalid mode defaults to
+        // CP437; otherwise the last mode is restored.
         let client_w = saved
             .as_ref()
             .map(|p| p.width)
@@ -1310,10 +1363,15 @@ pub fn run() -> WinResult<()> {
             None => (CW_USEDEFAULT, CW_USEDEFAULT),
         };
 
+        let start_mode = saved
+            .as_ref()
+            .map(|p| mode_from_prefs(p.mode))
+            .unwrap_or(Mode::Cp437);
+        let title = wide(title_for(start_mode));
         let hwnd = CreateWindowExW(
             app_ex_style(topmost),
             class_name,
-            w!("on99KB  —  CP437 螢幕鍵盤"),
+            PCWSTR(title.as_ptr()),
             APP_STYLE,
             win_x,
             win_y,
@@ -1326,6 +1384,7 @@ pub fn run() -> WinResult<()> {
         )?;
 
         let mut state = AppState::new()?;
+        state.mode = start_mode;
         if let Some(p) = saved.as_ref() {
             state.opacity = p.opacity;
             state.topmost = p.topmost;
@@ -1335,6 +1394,9 @@ pub fn run() -> WinResult<()> {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(Box::new(state)) as isize);
         apply_opacity(hwnd, opacity);
         apply_topmost(hwnd, topmost);
+        if let Some(state) = state_mut(hwnd) {
+            apply_mode_min_size(hwnd, state);
+        }
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
 
         let mut msg = MSG::default();
@@ -1708,6 +1770,7 @@ unsafe fn paint(hwnd: HWND) {
 
         draw_mode_switch(mem, state, rc);
         draw_opacity_btn(mem, state, rc);
+        draw_ascii_space_bar(mem, state, rc);
         draw_hint(mem, state, rc);
 
         SelectObject(mem, old_pen);
@@ -1790,6 +1853,39 @@ unsafe fn draw_opacity_btn(hdc: HDC, state: &AppState, client: RECT) {
     );
 }
 
+unsafe fn draw_ascii_space_bar(hdc: HDC, state: &AppState, client: RECT) {
+    let rc = AppState::space_bar_rect(client);
+    if rc.right - rc.left < 4 || rc.bottom - rc.top < 4 {
+        return;
+    }
+    let hit = Hit::AsciiSpace;
+    let brush = if state.pressed == Some(hit) {
+        state.brushes.pressed
+    } else if state.hover == Some(hit) {
+        state.brushes.hover
+    } else {
+        state.brushes.key
+    };
+    let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
+    let _ = RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, 6, 6);
+    SelectObject(hdc, old_brush);
+    let _ = SelectObject(hdc, HGDIOBJ(state.fonts.status.0));
+    SetTextColor(hdc, rgb(0xF4, 0xF5, 0xF8));
+    let mut text: Vec<u16> = "Space".encode_utf16().collect();
+    let mut text_rc = RECT {
+        left: rc.left + 2,
+        top: rc.top,
+        right: rc.right - 2,
+        bottom: rc.bottom,
+    };
+    DrawTextW(
+        hdc,
+        &mut text,
+        &mut text_rc,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+    );
+}
+
 unsafe fn draw_hint(hdc: HDC, state: &AppState, client: RECT) {
     let hint = hint_text(state);
     let mut hint_rc = AppState::hint_rect(client);
@@ -1810,6 +1906,9 @@ fn hint_text(state: &AppState) -> String {
             "透明度  ·  {}  ·  點擊切換 100% / 50% / 25%（100% 為完全不透明）",
             state.opacity.label()
         );
+    }
+    if matches!(state.hover, Some(Hit::AsciiSpace)) {
+        return "空白  ·  Space  ·  輸入空格（U+0020）到先前聚焦視窗".to_string();
     }
     if matches!(state.hover, Some(Hit::Brand) | Some(Hit::Cp437(0))) {
         return topmost_hint(state);
@@ -1873,7 +1972,11 @@ fn hint_text(state: &AppState) -> String {
                 format!("{}  ·  送到先前聚焦視窗", nav.label())
             }
             Some(Hit::Backspace) => {
-                "Bksp  ·  Backspace  ·  刪除先前聚焦視窗嘅一個字元（唔改速成編碼）".to_string()
+                if has_simplex_composition(state) {
+                    "Bksp  ·  取消今次速成取碼（唔會送到目標視窗）".to_string()
+                } else {
+                    "Bksp  ·  Backspace  ·  刪除先前聚焦視窗嘅一個字元（唔改速成編碼）".to_string()
+                }
             }
             Some(Hit::Delete) => "刪  ·  刪除一個速成碼".to_string(),
             _ if state.symbols_open => {
