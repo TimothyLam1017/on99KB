@@ -36,20 +36,22 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MAPVK_VK_TO_VSC, TME_LEAVE, TRACKMOUSEEVENT, VIRTUAL_KEY, VK_BACK, VK_END, VK_HOME, VK_NEXT,
     VK_PRIOR,
 };
+use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GetClientRect, GetCursorPos, GetMessageW, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect,
     IsIconic, KillTimer, LoadCursorW, LoadImageW, MessageBoxW, MoveWindow, PostQuitMessage,
     RegisterClassExW, SetCursor, SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW,
     SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW,
-    CW_USEDEFAULT, GWLP_USERDATA, HICON, HWND_TOPMOST, IDC_ARROW, IDC_HAND, IMAGE_ICON,
-    LR_DEFAULTCOLOR, LR_DEFAULTSIZE, LWA_ALPHA, MA_NOACTIVATE, MB_ICONERROR, MB_OK, MINMAXINFO,
-    MSG, SM_CXSMICON, SM_CXVIRTUALSCREEN, SM_CYSMICON, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-    SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_SHOWNOACTIVATE, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT,
-    WM_SETCURSOR, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
+    CW_USEDEFAULT, GWLP_USERDATA, HICON, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, IDC_HAND,
+    IMAGE_ICON, LR_DEFAULTCOLOR, LR_DEFAULTSIZE, LWA_ALPHA, MA_NOACTIVATE, MB_ICONERROR, MB_OK,
+    MINMAXINFO, MSG, SM_CXSMICON, SM_CXVIRTUALSCREEN, SM_CYSMICON, SM_CYVIRTUALSCREEN,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    SW_SHOWNOACTIVATE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_DESTROY, WM_DPICHANGED,
+    WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_PAINT, WM_SETCURSOR, WM_SIZE,
+    WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_EX_APPWINDOW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOPMOST, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
 };
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
@@ -80,13 +82,31 @@ const PUNCT_CHARS: [char; 4] = ['，', '。', '：', '；'];
 const ENGLISH_ROWS: [&[char]; 3] = [
     &['q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p'],
     &['a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l'],
-    &['z', 'x', 'c', 'v', 'b', 'n', 'm'],
+    &['z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.'],
 ];
 
 const APP_STYLE: WINDOW_STYLE =
     WINDOW_STYLE(WS_POPUP.0 | WS_CAPTION.0 | WS_SYSMENU.0 | WS_THICKFRAME.0 | WS_MINIMIZEBOX.0);
-const APP_EX_STYLE: WINDOW_EX_STYLE =
-    WINDOW_EX_STYLE(WS_EX_NOACTIVATE.0 | WS_EX_TOPMOST.0 | WS_EX_TOOLWINDOW.0 | WS_EX_LAYERED.0);
+/// Base extended style without TOPMOST so frame math stays consistent.
+/// Pinning uses `WS_EX_APPWINDOW` (no `WS_EX_TOOLWINDOW`) so the app can be
+/// pinned to the taskbar; Alt+Tab may then show it.
+const APP_EX_STYLE_BASE: WINDOW_EX_STYLE =
+    WINDOW_EX_STYLE(WS_EX_NOACTIVATE.0 | WS_EX_APPWINDOW.0 | WS_EX_LAYERED.0);
+fn app_ex_style(topmost: bool) -> WINDOW_EX_STYLE {
+    if topmost {
+        WINDOW_EX_STYLE(APP_EX_STYLE_BASE.0 | WS_EX_TOPMOST.0)
+    } else {
+        APP_EX_STYLE_BASE
+    }
+}
+
+fn latin_shifted_char(ch: char) -> char {
+    match ch {
+        ',' => '<',
+        '.' => '>',
+        _ => ch.to_ascii_uppercase(),
+    }
+}
 
 fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
     COLORREF(u32::from(r) | (u32::from(g) << 8) | (u32::from(b) << 16))
@@ -258,6 +278,7 @@ struct AppState {
     last_typed_cp437: Option<u8>,
     last_typed: Option<char>,
     opacity: prefs::Opacity,
+    topmost: bool,
     latin_shifted: bool,
     tracking: bool,
     fonts: Fonts,
@@ -278,6 +299,7 @@ impl AppState {
                 last_typed_cp437: None,
                 last_typed: None,
                 opacity: prefs::Opacity::DEFAULT,
+                topmost: true,
                 latin_shifted: false,
                 tracking: false,
                 fonts: Fonts::empty(),
@@ -955,10 +977,10 @@ fn save_prefs(hwnd: HWND) {
     unsafe {
         let _ = GetWindowRect(hwnd, &mut wr);
     }
-    let opacity = state_mut(hwnd)
-        .map(|s| s.opacity)
-        .unwrap_or(prefs::Opacity::DEFAULT);
-    let Some(p) = prefs::sanitize(w, h, Some(wr.left), Some(wr.top), opacity) else {
+    let (opacity, topmost) = state_mut(hwnd)
+        .map(|s| (s.opacity, s.topmost))
+        .unwrap_or((prefs::Opacity::DEFAULT, true));
+    let Some(p) = prefs::sanitize(w, h, Some(wr.left), Some(wr.top), opacity, topmost) else {
         return;
     };
     let Some(path) = prefs_path() else {
@@ -996,6 +1018,33 @@ fn clamp_window_pos(x: i32, y: i32, win_w: i32, win_h: i32) -> (i32, i32) {
 fn apply_opacity(hwnd: HWND, opacity: prefs::Opacity) {
     unsafe {
         let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), opacity.alpha(), LWA_ALPHA);
+    }
+}
+
+fn apply_topmost(hwnd: HWND, topmost: bool) {
+    unsafe {
+        let insert = if topmost {
+            HWND_TOPMOST
+        } else {
+            HWND_NOTOPMOST
+        };
+        let _ = SetWindowPos(
+            hwnd,
+            insert,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+    }
+}
+
+fn topmost_hint(state: &AppState) -> String {
+    if state.topmost {
+        "置頂  ·  開  ·  點擊取消置頂（唔會輸入）".to_string()
+    } else {
+        "置頂  ·  關  ·  點擊重新置頂（唔會輸入）".to_string()
     }
 }
 
@@ -1047,15 +1096,15 @@ fn apply_mode_min_size(hwnd: HWND, state: &AppState) {
         bottom: new_h,
     };
     unsafe {
-        let _ = AdjustWindowRectEx(&mut wr, APP_STYLE, false, APP_EX_STYLE);
+        let _ = AdjustWindowRectEx(&mut wr, APP_STYLE, false, APP_EX_STYLE_BASE);
         let _ = SetWindowPos(
             hwnd,
-            HWND_TOPMOST,
+            HWND::default(),
             0,
             0,
             wr.right - wr.left,
             wr.bottom - wr.top,
-            SWP_NOMOVE | SWP_NOACTIVATE,
+            SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOZORDER,
         );
     }
 }
@@ -1076,7 +1125,11 @@ fn commit_char(state: &mut AppState, ch: char) {
 
 fn activate_hit(hwnd: HWND, state: &mut AppState, hit: Hit) {
     match hit {
-        Hit::Cp437(0) | Hit::Brand => {}
+        Hit::Cp437(0) | Hit::Brand => {
+            state.topmost = !state.topmost;
+            apply_topmost(hwnd, state.topmost);
+            schedule_save(hwnd);
+        }
         Hit::Cp437(32) => {
             // The Alt+32 cell is labelled BS and sends Backspace, not a space.
             let _ = send_vk(VK_BACK, false);
@@ -1182,6 +1235,7 @@ pub fn run_or_report() {
 pub fn run() -> WinResult<()> {
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        SetCurrentProcessExplicitAppUserModelID(w!("TimothyLam1017.on99KB"))?;
 
         let instance = GetModuleHandleW(None)?;
         let class_name = w!("on99KB.Window");
@@ -1246,7 +1300,8 @@ pub fn run() -> WinResult<()> {
             right: client_w,
             bottom: client_h,
         };
-        AdjustWindowRectEx(&mut wr, APP_STYLE, false, APP_EX_STYLE)?;
+        let topmost = saved.as_ref().map(|p| p.topmost).unwrap_or(true);
+        AdjustWindowRectEx(&mut wr, APP_STYLE, false, APP_EX_STYLE_BASE)?;
         let win_w = wr.right - wr.left;
         let win_h = wr.bottom - wr.top;
 
@@ -1256,7 +1311,7 @@ pub fn run() -> WinResult<()> {
         };
 
         let hwnd = CreateWindowExW(
-            APP_EX_STYLE,
+            app_ex_style(topmost),
             class_name,
             w!("on99KB  —  CP437 螢幕鍵盤"),
             APP_STYLE,
@@ -1273,20 +1328,13 @@ pub fn run() -> WinResult<()> {
         let mut state = AppState::new()?;
         if let Some(p) = saved.as_ref() {
             state.opacity = p.opacity;
+            state.topmost = p.topmost;
         }
         let opacity = state.opacity;
+        let topmost = state.topmost;
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(Box::new(state)) as isize);
         apply_opacity(hwnd, opacity);
-
-        let _ = SetWindowPos(
-            hwnd,
-            HWND_TOPMOST,
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-        );
+        apply_topmost(hwnd, topmost);
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
 
         let mut msg = MSG::default();
@@ -1318,7 +1366,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     right: min_w,
                     bottom: min_h,
                 };
-                let _ = AdjustWindowRectEx(&mut wr, APP_STYLE, false, APP_EX_STYLE);
+                let _ = AdjustWindowRectEx(&mut wr, APP_STYLE, false, APP_EX_STYLE_BASE);
                 (*info).ptMinTrackSize = POINT {
                     x: wr.right - wr.left,
                     y: wr.bottom - wr.top,
@@ -1345,6 +1393,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let _ = InvalidateRect(hwnd, None, false);
             LRESULT(0)
         }
+        WM_MOVE => {
+            if !IsIconic(hwnd).as_bool() {
+                schedule_save(hwnd);
+            }
+            LRESULT(0)
+        }
         WM_SIZE => {
             if wparam.0 as u32 != SIZE_MINIMIZED {
                 schedule_save(hwnd);
@@ -1353,6 +1407,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 state.font_key = (0, 0, 0, 255);
             }
             let _ = InvalidateRect(hwnd, None, false);
+            LRESULT(0)
+        }
+        WM_EXITSIZEMOVE => {
+            save_prefs(hwnd);
             LRESULT(0)
         }
         WM_TIMER => {
@@ -1367,9 +1425,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             let rc = client_rect(hwnd);
                             let (x, y) = cursor_in_client(hwnd);
                             if state.hit_test(rc, x, y) == Some(Hit::Latin(ch)) {
-                                let upper = ch.to_ascii_uppercase();
-                                let _ = send_unicode(upper);
-                                state.last_typed = Some(upper);
+                                let shifted = latin_shifted_char(ch);
+                                let _ = send_unicode(shifted);
+                                state.last_typed = Some(shifted);
                                 state.latin_shifted = true;
                             }
                         }
@@ -1753,12 +1811,18 @@ fn hint_text(state: &AppState) -> String {
             state.opacity.label()
         );
     }
+    if matches!(state.hover, Some(Hit::Brand) | Some(Hit::Cp437(0))) {
+        return topmost_hint(state);
+    }
     match state.mode {
         Mode::Cp437 => {
             if let Some(code) = match state.hover {
                 Some(Hit::Cp437(c)) => Some(c),
                 _ => state.last_typed_cp437,
             } {
+                if code == 0 {
+                    return topmost_hint(state);
+                }
                 if code == 32 {
                     let text = "BS  ·  Backspace  ·  刪除先前聚焦視窗嘅一個字元";
                     if state.last_typed_cp437 == Some(32)
@@ -1793,9 +1857,15 @@ fn hint_text(state: &AppState) -> String {
                 )
             }
             Some(Hit::Latin(ch)) => {
-                format!("英文  ·  {ch}  ·  短按小寫、按住 {LATIN_HOLD_MS}ms 大寫（唔係速成碼）")
+                let shifted = latin_shifted_char(ch);
+                if ch == ',' || ch == '.' {
+                    format!(
+                        "英文  ·  {ch}  ·  短按 {ch}、按住 {LATIN_HOLD_MS}ms 出 {shifted}（唔係速成碼）"
+                    )
+                } else {
+                    format!("英文  ·  {ch}  ·  短按小寫、按住 {LATIN_HOLD_MS}ms 大寫（唔係速成碼）")
+                }
             }
-            Some(Hit::Brand) => "on99KB  ·  速成 螢幕鍵盤  ·  標籤，唔會輸入".to_string(),
             Some(Hit::Digit(ch)) | Some(Hit::Punct(ch)) => {
                 format!("點擊輸入  ·  {ch}  到先前聚焦視窗")
             }
@@ -2005,15 +2075,24 @@ unsafe fn draw_brand_chip(hdc: HDC, state: &AppState, rc: RECT) {
         state.brushes.pressed
     } else if state.hover == Some(hit) {
         state.brushes.hover
+    } else if state.topmost {
+        state.brushes.selected
     } else {
-        state.brushes.special
+        state.brushes.disabled
     };
     let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
     let radius = ((rc.bottom - rc.top).min(rc.right - rc.left) / 6).clamp(2, 8);
     let _ = RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
     SelectObject(hdc, old_brush);
     let _ = SelectObject(hdc, HGDIOBJ(state.fonts.named.0));
-    SetTextColor(hdc, rgb(0x8E, 0xC8, 0xFF));
+    SetTextColor(
+        hdc,
+        if state.topmost {
+            rgb(0x8E, 0xC8, 0xFF)
+        } else {
+            rgb(0x7A, 0x80, 0x8C)
+        },
+    );
     let mut text: Vec<u16> = "on99KB".encode_utf16().collect();
     let mut text_rc = RECT {
         left: rc.left + 1,
@@ -2047,7 +2126,7 @@ unsafe fn draw_english_key(hdc: HDC, state: &AppState, rc: RECT, letter: char) {
     SelectObject(hdc, old_brush);
     let shifted = state.latin_shifted && state.pressed == Some(Hit::Latin(letter));
     let glyph = if shifted {
-        letter.to_ascii_uppercase()
+        latin_shifted_char(letter)
     } else {
         letter
     };
@@ -2233,7 +2312,13 @@ unsafe fn draw_cp437_key(hdc: HDC, state: &AppState, client: RECT, code: u8) {
         state.brushes.pressed
     } else if state.hover == Some(hit) {
         state.brushes.hover
-    } else if code == 0 || cp437::is_named_blank(code) {
+    } else if code == 0 {
+        if state.topmost {
+            state.brushes.selected
+        } else {
+            state.brushes.disabled
+        }
+    } else if cp437::is_named_blank(code) {
         state.brushes.special
     } else {
         state.brushes.key
@@ -2259,7 +2344,11 @@ unsafe fn draw_cp437_key(hdc: HDC, state: &AppState, client: RECT, code: u8) {
         SetTextColor(
             hdc,
             if code == 0 {
-                rgb(0x8E, 0xC8, 0xFF)
+                if state.topmost {
+                    rgb(0x8E, 0xC8, 0xFF)
+                } else {
+                    rgb(0x7A, 0x80, 0x8C)
+                }
             } else {
                 rgb(0xE8, 0xE4, 0xC8)
             },

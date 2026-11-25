@@ -1,4 +1,4 @@
-//! Remembered window size and opacity. Mode is never persisted.
+//! Remembered window size, position, opacity, and always-on-top. Mode is never persisted.
 
 /// First-launch and minimum CP437 client size, in pixels.
 ///
@@ -75,6 +75,8 @@ pub struct WindowPrefs {
     pub x: Option<i32>,
     pub y: Option<i32>,
     pub opacity: Opacity,
+    /// Always-on-top. Missing or invalid ini values default to `true`.
+    pub topmost: bool,
 }
 
 pub fn sanitize(
@@ -83,6 +85,7 @@ pub fn sanitize(
     x: Option<i32>,
     y: Option<i32>,
     opacity: Opacity,
+    topmost: bool,
 ) -> Option<WindowPrefs> {
     if !(MIN_CLIENT_W..=MAX_CLIENT).contains(&width) {
         return None;
@@ -96,19 +99,22 @@ pub fn sanitize(
         x,
         y,
         opacity,
+        topmost,
     })
 }
 
 /// Parse a small `width=` / `height=` / optional `x=` / `y=` / optional
-/// `opacity=` ini. Corrupt or out-of-range sizes yield `None` (caller uses
-/// the default). A missing or invalid `opacity` falls back to 100% and does
-/// not discard a valid size.
+/// `opacity=` / optional `topmost=` ini. Corrupt or out-of-range sizes yield
+/// `None` (caller uses the default). A missing or invalid `opacity` falls
+/// back to 100%, and a missing or invalid `topmost` falls back to on (1);
+/// neither discards a valid size.
 pub fn parse_window_ini(s: &str) -> Option<WindowPrefs> {
     let mut width = None;
     let mut height = None;
     let mut x = None;
     let mut y = None;
     let mut opacity = Opacity::DEFAULT;
+    let mut topmost = true;
     for raw in s.lines() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
@@ -130,18 +136,24 @@ pub fn parse_window_ini(s: &str) -> Option<WindowPrefs> {
                     opacity = o;
                 }
             }
+            "topmost" => match n {
+                1 => topmost = true,
+                0 => topmost = false,
+                _ => {}
+            },
             _ => {}
         }
     }
-    sanitize(width?, height?, x, y, opacity)
+    sanitize(width?, height?, x, y, opacity, topmost)
 }
 
 pub fn format_window_ini(prefs: &WindowPrefs) -> String {
     let mut s = format!(
-        "# on99KB window size (client area, pixels) and opacity. Mode is not stored.\nwidth={}\nheight={}\nopacity={}\n",
+        "# on99KB window size (client area, pixels), opacity, and always-on-top. Mode is not stored.\nwidth={}\nheight={}\nopacity={}\ntopmost={}\n",
         prefs.width,
         prefs.height,
-        prefs.opacity.percent()
+        prefs.opacity.percent(),
+        if prefs.topmost { 1 } else { 0 }
     );
     if let (Some(x), Some(y)) = (prefs.x, prefs.y) {
         s.push_str(&format!("x={x}\ny={y}\n"));
@@ -169,9 +181,12 @@ mod tests {
         assert_eq!(p.x, Some(10));
         assert_eq!(p.y, Some(20));
         assert_eq!(p.opacity, Opacity::DEFAULT);
+        assert!(p.topmost);
         let again = parse_window_ini(&format_window_ini(&p)).unwrap();
         assert_eq!(p, again);
-        assert!(format_window_ini(&p).contains("opacity=100"));
+        let formatted = format_window_ini(&p);
+        assert!(formatted.contains("opacity=100"));
+        assert!(formatted.contains("topmost=1"));
     }
 
     #[test]
@@ -196,6 +211,26 @@ mod tests {
     }
 
     #[test]
+    fn topmost_parses_and_falls_back() {
+        let p = parse_window_ini("width=480\nheight=460\ntopmost=0\n").unwrap();
+        assert!(!p.topmost);
+        assert_eq!(p.width, 480);
+        let p = parse_window_ini("width=480\nheight=460\ntopmost=1\n").unwrap();
+        assert!(p.topmost);
+        // invalid or missing topmost must not drop a valid size, and defaults to on
+        let p = parse_window_ini("width=480\nheight=460\ntopmost=2\n").unwrap();
+        assert!(p.topmost);
+        let p = parse_window_ini("width=480\nheight=460\n").unwrap();
+        assert!(p.topmost);
+        let off = sanitize(480, 460, Some(10), Some(20), Opacity::P50, false).unwrap();
+        let text = format_window_ini(&off);
+        assert!(text.contains("topmost=0"));
+        assert!(text.contains("opacity=50"));
+        let again = parse_window_ini(&text).unwrap();
+        assert_eq!(off, again);
+    }
+
+    #[test]
     fn ignores_corrupt_and_out_of_range() {
         assert!(parse_window_ini("").is_none());
         assert!(parse_window_ini("width=abc\nheight=460\n").is_none());
@@ -209,5 +244,6 @@ mod tests {
         assert_eq!(p.height, 460);
         assert_eq!(p.x, None);
         assert_eq!(p.opacity, Opacity::P100);
+        assert!(p.topmost);
     }
 }
