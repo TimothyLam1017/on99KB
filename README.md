@@ -10,11 +10,11 @@ Clicking a key types that character into the **previously focused** window. The 
 
 - Native Win32 GUI (Rust + [`windows`](https://crates.io/crates/windows) crate). No webview, no admin rights, no telemetry, no hooks.
 - Two modes, switched from a segmented control on the **bottom bar** (`CP437｜速成`). The window title shows the current mode. The app **always opens in CP437**; the last mode is not remembered.
-- All **255** CP437 glyphs (codes 1..=255). Code 32 is a normal space (`空格`); code 255 is a non-breaking space U+00A0 (`不換行空格`).
-- **速成** mode: a standard Cangjie letter-to-radical keyboard (every key shows the radical and the letter), a top candidate bar of nine characters with paging, and 刪 / 清除 / 空格. Only first + last codes (not full Cangjie). Hong Kong characters share the same candidate bar. Common spoken-Cantonese characters are promoted earlier in their lists. Candidate order is **not** claimed to match Microsoft 速成.
+- All **255** CP437 glyphs are in the table (codes 1..=255). Code 255 is a non-breaking space U+00A0 (`不換行空格`). The former Alt+32 space *cell* is labelled **BS** and sends Backspace (`VK_BACK`) to the previously focused window instead of a space character (the U+0020 mapping itself is unchanged in the library).
+- **速成** mode: a standard Cangjie letter-to-radical keyboard (every key shows the radical and the letter), a top candidate bar of nine characters with paging, and 刪 / 清除 / 空格. A compact row of digits `1–9 0` plus **Bksp**, and a row of fullwidth `，` `。` `：` `；` plus Home / End / PgUp / PgDn, sit under the candidate bar (they stay usable while the 符號 pad is open). Digits and punctuation are typed with Unicode `SendInput`; Bksp sends `VK_BACK` and the nav keys send `VK_HOME` / `VK_END` / `VK_PRIOR` / `VK_NEXT` (extended) into the previously focused window. **刪** only deletes one 速成 composition code — it is not Backspace. Below the radical keyboard (and below the 符號 pad when that is open), a lowercase English QWERTY keyboard (`qwertyuiop` / `asdfghjkl` / `zxcvbnm`) occupies the remaining band above the action keys. Those keys send Latin letters with Unicode `SendInput` and are visually distinct from the 速成 radical keys, which still add composition codes. Only first + last codes (not full Cangjie). Hong Kong characters share the same candidate bar. Common spoken-Cantonese characters are promoted earlier in their lists. Candidate order is **not** claimed to match Microsoft 速成.
 - **符號** button (速成 layout only): opens the publicly documented Microsoft 倉頡 / 速成 Ctrl+Alt+, symbol keyboard (from 「┌」 through 「※」, plus the rest of that same official keyboard). Clicking a symbol uses `SendInput`. The physical Ctrl+Alt+, shortcut is not implemented. See [Sources](#sources).
 - Mouse / on-screen keyboard only. No focus steal (`WS_EX_NOACTIVATE` + `WM_MOUSEACTIVATE` / `MA_NOACTIVATE`) and no hooks. Physical 1–9 / Space are not handled.
-- First launch (no saved size) opens at the compact CP437 client size **480×460**, matching the measured reference screenshot (the PNG is 495×510 including a teal desktop margin; the window itself is about 482×492 with a 31 px title bar; the client area is exactly 480×460). The bottom status bar stays visible (~28 px). This is the actual default open size, not only a minimum the user has to drag down to. After you resize, the last **window size** (client area, and position when available) is remembered in `%APPDATA%\on99KB\window.ini`. Mode is not saved. Switching into 速成 reserves extra client height only for the top candidate row and grows the window just enough, without activating it, if the current height would clip the candidate bar or the bottom bar.
+- First launch (no saved size) opens at the compact CP437 client size **480×460**, matching the measured reference screenshot (the PNG is 495×510 including a teal desktop margin; the window itself is about 482×492 with a 31 px title bar; the client area is exactly 480×460). The bottom status bar stays visible (~28 px). This is the actual default open size, not only a minimum the user has to drag down to. After you resize, the last **window size** (client area, and position when available) is remembered in `%APPDATA%\on99KB\window.ini`. Mode is not saved. Switching into 速成 grows the window just enough (`SWP_NOACTIVATE`) if the current height would clip the candidate bar, the digit / punctuation / nav rows, a readable radical keyboard, the lowercase English QWERTY band, the compact action row, or the bottom bar. The CP437 first-launch / minimum client size remains **480×460**.
 - Always on top (`WS_EX_TOPMOST`) and a tool window.
 - Types the actual Unicode glyph with `SendInput` and `KEYEVENTF_UNICODE` (including non-BMP characters; not a simulated Alt+numpad sequence).
 - In CP437, each key shows the glyph and the `Alt+n` code when there is room (captions hide when the key is shorter than 30 px, as on the compact default window). Tight truncation of long labels (for example `on...`, `不...`) is expected at that size.
@@ -28,7 +28,7 @@ Download `on99KB.exe` from the [Releases](https://github.com/TimothyLam1017/on99
 1. Double-click `on99KB.exe`. A compact tool window stays on top, in CP437 mode.
 2. Click the window you want to type into (Notepad, a browser, a terminal, …) so it has focus.
 3. Click a key on on99KB. The character is inserted into that focused window.
-4. Use `CP437｜速成` on the bottom bar to switch mode. In 速成, click radicals (at most two codes), then a candidate or 空格 to commit. 符號 opens the Ctrl+Alt+, symbol keyboard.
+4. Use `CP437｜速成` on the bottom bar to switch mode. In 速成, click radicals (at most two codes), then a candidate or 空格 to commit. 符號 opens the Ctrl+Alt+, symbol keyboard. Digits, fullwidth punctuation, Home/End/PgUp/PgDn, Bksp, and the lowercase English letter rows type into the previously focused window (the English keys are not 速成 codes). In CP437, the **BS** key (the old Alt+32 space cell) also sends Backspace.
 5. Drag any window edge or corner to resize; the keys scale automatically. The last size is restored the next time you open the app.
 6. Close it with the window’s close button.
 
@@ -75,7 +75,7 @@ The CP437 layout is a 16×16 grid (256 cells). Cell 0 is a title cell. Cells 1�
 |------|-----------|--------|
 | 1 | ☺ | |
 | 3 | ♥ | |
-| 32 | space | labelled 空格 |
+| 32 | space | cell labelled BS (sends Backspace, not a space) |
 | 65 | A | |
 | 127 | ⌂ | |
 | 219 | █ | |

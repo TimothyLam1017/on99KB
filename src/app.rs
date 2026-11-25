@@ -5,8 +5,11 @@
 //! focus. Characters are injected with `SendInput` + `KEYEVENTF_UNICODE`.
 //!
 //! First launch (no saved size) opens at the measured CP437 client size
-//! 480×460 — not the old 900×820 default. 速成 reserves extra client height
-//! only for the top candidate row. Last window size is remembered; mode is not.
+//! 480×460 — not the old 900×820 default. 速成 keeps that compactness when it
+//! fits, and otherwise grows just enough (SWP_NOACTIVATE) for the candidate
+//! bar, auxiliary rows, a readable radical keyboard, a lowercase English
+//! QWERTY band, a compact action row, and the status bar. Last window size
+//! is remembered; mode is not.
 
 #![cfg(windows)]
 
@@ -28,8 +31,10 @@ use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SendInput, SetCapture, TrackMouseEvent, INPUT, INPUT_0, INPUT_KEYBOARD,
-    KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, TME_LEAVE, TRACKMOUSEEVENT, VIRTUAL_KEY,
+    MapVirtualKeyW, ReleaseCapture, SendInput, SetCapture, TrackMouseEvent, INPUT, INPUT_0,
+    INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
+    MAPVK_VK_TO_VSC, TME_LEAVE, TRACKMOUSEEVENT, VIRTUAL_KEY, VK_BACK, VK_END, VK_HOME, VK_NEXT,
+    VK_PRIOR,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
@@ -56,9 +61,24 @@ const COLS: i32 = 16;
 const ROWS: i32 = 16;
 const GRID_PAD: i32 = 8;
 const KEY_GAP: i32 = 3;
-const CANDIDATE_ROW_H: i32 = 52;
+const CANDIDATE_ROW_H: i32 = 48;
 const MODE_SEG_W: i32 = 62;
 const ICON_RESOURCE_ID: u16 = 1;
+const AUX_ROW_H: i32 = 28;
+const LETTER_ROW_MIN_H: i32 = 46;
+const LETTER_ROW_MAX_H: i32 = 54;
+const ACTION_ROW_H: i32 = 26;
+const SIMPLEX_GAP: i32 = 3;
+const ENGLISH_ROW_MIN_H: i32 = 22;
+const ENGLISH_ROW_MAX_H: i32 = 54;
+
+const DIGIT_CHARS: [char; 10] = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '0'];
+const PUNCT_CHARS: [char; 4] = ['，', '。', '：', '；'];
+const ENGLISH_ROWS: [&[char]; 3] = [
+    &['q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p'],
+    &['a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l'],
+    &['z', 'x', 'c', 'v', 'b', 'n', 'm'],
+];
 
 const APP_STYLE: WINDOW_STYLE =
     WINDOW_STYLE(WS_POPUP.0 | WS_CAPTION.0 | WS_SYSMENU.0 | WS_THICKFRAME.0 | WS_MINIMIZEBOX.0);
@@ -123,6 +143,41 @@ enum Hit {
     Space,
     SymbolToggle,
     Symbol(char),
+    Digit(char),
+    Punct(char),
+    Nav(NavKey),
+    Backspace,
+    Latin(char),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NavKey {
+    Home,
+    End,
+    PageUp,
+    PageDown,
+}
+
+impl NavKey {
+    const ALL: [NavKey; 4] = [NavKey::Home, NavKey::End, NavKey::PageUp, NavKey::PageDown];
+
+    fn label(self) -> &'static str {
+        match self {
+            NavKey::Home => "Home",
+            NavKey::End => "End",
+            NavKey::PageUp => "PgUp",
+            NavKey::PageDown => "PgDn",
+        }
+    }
+
+    fn vk(self) -> VIRTUAL_KEY {
+        match self {
+            NavKey::Home => VK_HOME,
+            NavKey::End => VK_END,
+            NavKey::PageUp => VK_PRIOR,
+            NavKey::PageDown => VK_NEXT,
+        }
+    }
 }
 
 struct Fonts {
@@ -132,6 +187,7 @@ struct Fonts {
     status: HFONT,
     radical: HFONT,
     letter: HFONT,
+    english: HFONT,
     cand_jhenghei: HFONT,
     cand_hkscs: HFONT,
     cand_extb: HFONT,
@@ -146,6 +202,7 @@ impl Fonts {
             status: HFONT::default(),
             radical: HFONT::default(),
             letter: HFONT::default(),
+            english: HFONT::default(),
             cand_jhenghei: HFONT::default(),
             cand_hkscs: HFONT::default(),
             cand_extb: HFONT::default(),
@@ -160,6 +217,7 @@ impl Fonts {
             &mut self.status,
             &mut self.radical,
             &mut self.letter,
+            &mut self.english,
             &mut self.cand_jhenghei,
             &mut self.cand_hkscs,
             &mut self.cand_extb,
@@ -179,6 +237,7 @@ struct Brushes {
     hover: HBRUSH,
     pressed: HBRUSH,
     special: HBRUSH,
+    english: HBRUSH,
     selected: HBRUSH,
     disabled: HBRUSH,
     border: HPEN,
@@ -196,7 +255,7 @@ struct AppState {
     tracking: bool,
     fonts: Fonts,
     brushes: Brushes,
-    font_key: (i32, i32, u8),
+    font_key: (i32, i32, i32, u8),
 }
 
 impl AppState {
@@ -220,11 +279,12 @@ impl AppState {
                     hover: CreateSolidBrush(rgb(0x3A, 0x58, 0x88)),
                     pressed: CreateSolidBrush(rgb(0x1E, 0x6E, 0xBE)),
                     special: CreateSolidBrush(rgb(0x34, 0x2C, 0x3C)),
+                    english: CreateSolidBrush(rgb(0x1C, 0x2E, 0x34)),
                     selected: CreateSolidBrush(rgb(0x1E, 0x6E, 0xBE)),
                     disabled: CreateSolidBrush(rgb(0x1A, 0x1C, 0x22)),
                     border: CreatePen(PS_SOLID, 1, rgb(0x18, 0x1A, 0x20)),
                 },
-                font_key: (0, 0, 255),
+                font_key: (0, 0, 0, 255),
             })
         }
     }
@@ -232,7 +292,7 @@ impl AppState {
     fn min_client(&self) -> (i32, i32) {
         match self.mode {
             Mode::Cp437 => (prefs::MIN_CLIENT_W, prefs::MIN_CLIENT_H),
-            Mode::Simplex => (prefs::MIN_CLIENT_W, prefs::MIN_CLIENT_H + CANDIDATE_ROW_H),
+            Mode::Simplex => (prefs::MIN_CLIENT_W, simplex_min_client_h()),
         }
     }
 
@@ -318,16 +378,6 @@ impl AppState {
         }
     }
 
-    fn keyboard_rect(client: RECT) -> RECT {
-        let status = Self::status_h(client.bottom - client.top);
-        RECT {
-            left: GRID_PAD,
-            top: CANDIDATE_ROW_H + 2,
-            right: (client.right - GRID_PAD).max(GRID_PAD + 16),
-            bottom: (client.bottom - status - 2).max(CANDIDATE_ROW_H + 18),
-        }
-    }
-
     fn current_candidates(&self) -> &'static [char] {
         if self.mode != Mode::Simplex || self.symbols_open {
             return &[];
@@ -381,19 +431,6 @@ fn candidate_parts(client: RECT) -> (RECT, [RECT; 9], RECT, RECT) {
     (codes, slots, prev, next)
 }
 
-fn row_rects(area: RECT, rows: i32) -> Vec<RECT> {
-    let h = (area.bottom - area.top).max(rows);
-    let rh = h / rows;
-    (0..rows)
-        .map(|i| RECT {
-            left: area.left,
-            top: area.top + i * rh,
-            right: area.right,
-            bottom: area.top + (i + 1) * rh - KEY_GAP,
-        })
-        .collect()
-}
-
 fn centered_keys(row: RECT, count: i32, key_w: i32) -> Vec<RECT> {
     let total = count * key_w + (count - 1) * KEY_GAP;
     let x0 = row.left + ((row.right - row.left) - total).max(0) / 2;
@@ -407,59 +444,227 @@ fn centered_keys(row: RECT, count: i32, key_w: i32) -> Vec<RECT> {
         .collect()
 }
 
-fn letter_key_rects(kb: RECT) -> (Vec<(char, RECT)>, Vec<(Hit, &'static str, RECT)>) {
-    let rows = row_rects(kb, 4);
-    let usable_w = (kb.right - kb.left).max(40);
-    let key_w = ((usable_w - 9 * KEY_GAP) / 10).max(16);
-    let q = centered_keys(rows[0], 10, key_w);
-    let a = centered_keys(rows[1], 9, key_w);
-    let z = centered_keys(rows[2], 7, key_w);
-    let mut letters = Vec::new();
-    for (ch, rc) in simplex::ROW_QWERTY.iter().copied().zip(q) {
-        letters.push((ch, rc));
-    }
-    for (ch, rc) in simplex::ROW_ASDF.iter().copied().zip(a) {
-        letters.push((ch, rc));
-    }
-    for (ch, rc) in simplex::ROW_ZXCV.iter().copied().zip(z) {
-        letters.push((ch, rc));
-    }
-    let action_w = ((usable_w - 3 * KEY_GAP) / 4).min(key_w * 2).max(key_w);
-    let actions_rc = centered_keys(rows[3], 4, action_w);
-    let actions = vec![
-        (Hit::Delete, "刪", actions_rc[0]),
-        (Hit::Clear, "清除", actions_rc[1]),
-        (Hit::Space, "空格", actions_rc[2]),
-        (Hit::SymbolToggle, "符號", actions_rc[3]),
-    ];
-    (letters, actions)
+fn simplex_min_client_h() -> i32 {
+    let needed = CANDIDATE_ROW_H
+        + 2
+        + AUX_ROW_H
+        + SIMPLEX_GAP
+        + AUX_ROW_H
+        + SIMPLEX_GAP
+        + LETTER_ROW_MIN_H * 3
+        + SIMPLEX_GAP * 2
+        + SIMPLEX_GAP
+        + ENGLISH_ROW_MIN_H * 3
+        + SIMPLEX_GAP * 2
+        + SIMPLEX_GAP
+        + ACTION_ROW_H
+        + 2
+        + 28;
+    needed.max(prefs::MIN_CLIENT_H)
 }
 
-fn symbol_key_rects(
-    kb: RECT,
-) -> (
-    Vec<(char, RECT, &'static str)>,
-    Vec<(Hit, &'static str, RECT)>,
-) {
-    let rows = row_rects(kb, 5);
-    let usable_w = (kb.right - kb.left).max(40);
-    let key_w = ((usable_w - 12 * KEY_GAP) / 13).max(14);
-    let mut keys = Vec::new();
-    for (i, row) in simplex::SYMBOL_ROWS.iter().enumerate() {
-        let recs = centered_keys(rows[i], row.len() as i32, key_w);
-        for (sk, rc) in row.iter().zip(recs) {
-            keys.push((sk.glyph, rc, sk.key));
+struct SimplexLayout {
+    digits: Vec<(char, RECT)>,
+    backspace: RECT,
+    puncts: Vec<(char, RECT)>,
+    navs: Vec<(NavKey, RECT)>,
+    letters: Vec<(char, RECT)>,
+    symbols: Vec<(char, RECT, &'static str)>,
+    actions: Vec<(Hit, &'static str, RECT)>,
+    english: Vec<(char, RECT)>,
+    letter_h: i32,
+    english_h: i32,
+}
+
+fn action_rects(row: RECT) -> Vec<(Hit, &'static str, RECT)> {
+    let usable = (row.right - row.left).max(40);
+    // Clearly shorter than letter keys (row height is ACTION_ROW_H) and not
+    // stretched as wide as the old full-pitch buttons.
+    let action_w = ((usable - 3 * KEY_GAP) / 4).clamp(40, 72);
+    let recs = centered_keys(row, 4, action_w);
+    vec![
+        (Hit::Delete, "刪", recs[0]),
+        (Hit::Clear, "清除", recs[1]),
+        (Hit::Space, "空格", recs[2]),
+        (Hit::SymbolToggle, "符號", recs[3]),
+    ]
+}
+
+fn simplex_layout(client: RECT, symbols_open: bool) -> SimplexLayout {
+    let left = GRID_PAD;
+    let right = (client.right - GRID_PAD).max(left + 40);
+    let usable = right - left;
+
+    let y = CANDIDATE_ROW_H + 2;
+    let num_row = RECT {
+        left,
+        top: y,
+        right,
+        bottom: y + AUX_ROW_H,
+    };
+    // 1–9 0 plus a slightly wider Bksp at the end, like a keyboard.
+    let unit = ((usable - 10 * KEY_GAP) as f32 / 11.6).max(14.0);
+    let digit_w = unit as i32;
+    let bksp_w = ((unit * 1.6) as i32).max(digit_w + 8);
+    let total = digit_w * 10 + bksp_w + 10 * KEY_GAP;
+    let x0 = left + (usable - total).max(0) / 2;
+    let mut digits = Vec::new();
+    for (i, ch) in DIGIT_CHARS.iter().copied().enumerate() {
+        let x = x0 + (i as i32) * (digit_w + KEY_GAP);
+        digits.push((
+            ch,
+            RECT {
+                left: x,
+                top: num_row.top,
+                right: x + digit_w,
+                bottom: num_row.bottom,
+            },
+        ));
+    }
+    let bx = x0 + 10 * (digit_w + KEY_GAP);
+    let backspace = RECT {
+        left: bx,
+        top: num_row.top,
+        right: bx + bksp_w,
+        bottom: num_row.bottom,
+    };
+
+    let y2 = num_row.bottom + SIMPLEX_GAP;
+    let aux2 = RECT {
+        left,
+        top: y2,
+        right,
+        bottom: y2 + AUX_ROW_H,
+    };
+    let aux2_w = ((usable - 7 * KEY_GAP) / 8).max(16);
+    let aux2_keys = centered_keys(aux2, 8, aux2_w);
+    let mut puncts = Vec::new();
+    for (ch, rc) in PUNCT_CHARS
+        .iter()
+        .copied()
+        .zip(aux2_keys.iter().copied().take(4))
+    {
+        puncts.push((ch, rc));
+    }
+    let mut navs = Vec::new();
+    for (nav, rc) in NavKey::ALL
+        .iter()
+        .copied()
+        .zip(aux2_keys.iter().copied().skip(4))
+    {
+        navs.push((nav, rc));
+    }
+
+    let status = AppState::status_h(client.bottom - client.top);
+    let action_bottom = client.bottom - status - 2;
+    let action_top = action_bottom - ACTION_ROW_H;
+    let action_row = RECT {
+        left,
+        top: action_top,
+        right,
+        bottom: action_bottom,
+    };
+    let actions = action_rects(action_row);
+
+    let content_top = aux2.bottom + SIMPLEX_GAP;
+    let content_bottom = action_top - SIMPLEX_GAP;
+    let avail = (content_bottom - content_top).max(1);
+
+    let mut letters = Vec::new();
+    let mut symbols = Vec::new();
+    let letter_h;
+
+    if symbols_open {
+        let rh = ((avail - 3 * SIMPLEX_GAP) / 4).clamp(22, 48);
+        letter_h = rh;
+        let key_w = ((usable - 12 * KEY_GAP) / 13).max(14);
+        for (i, row) in simplex::SYMBOL_ROWS.iter().enumerate() {
+            let row_rc = RECT {
+                left,
+                top: content_top + (i as i32) * (rh + SIMPLEX_GAP),
+                right,
+                bottom: content_top + (i as i32) * (rh + SIMPLEX_GAP) + rh,
+            };
+            let recs = centered_keys(row_rc, row.len() as i32, key_w);
+            for (sk, rc) in row.iter().zip(recs) {
+                symbols.push((sk.glyph, rc, sk.key));
+            }
+        }
+    } else {
+        letter_h = ((avail - 2 * SIMPLEX_GAP) / 3).clamp(LETTER_ROW_MIN_H, LETTER_ROW_MAX_H);
+        let key_w = ((usable - 9 * KEY_GAP) / 10).max(16);
+        let rows_chars: [&[char]; 3] = [simplex::ROW_QWERTY, simplex::ROW_ASDF, simplex::ROW_ZXCV];
+        for (i, row_chars) in rows_chars.iter().enumerate() {
+            let row_rc = RECT {
+                left,
+                top: content_top + (i as i32) * (letter_h + SIMPLEX_GAP),
+                right,
+                bottom: content_top + (i as i32) * (letter_h + SIMPLEX_GAP) + letter_h,
+            };
+            let recs = centered_keys(row_rc, row_chars.len() as i32, key_w);
+            for (ch, rc) in row_chars.iter().copied().zip(recs) {
+                letters.push((ch, rc));
+            }
         }
     }
-    let action_w = ((usable_w - 3 * KEY_GAP) / 4).min(key_w * 3).max(key_w);
-    let actions_rc = centered_keys(rows[4], 4, action_w);
-    let actions = vec![
-        (Hit::Delete, "刪", actions_rc[0]),
-        (Hit::Clear, "清除", actions_rc[1]),
-        (Hit::Space, "空格", actions_rc[2]),
-        (Hit::SymbolToggle, "符號", actions_rc[3]),
-    ];
-    (keys, actions)
+
+    // Occupy the leftover band under the radical / 符號 keyboard; do not
+    // move the action row or raise the capped radical rows to close it.
+    let last_kb_bottom = if symbols_open {
+        symbols
+            .iter()
+            .map(|(_, rc, _)| rc.bottom)
+            .max()
+            .unwrap_or(content_top)
+    } else {
+        letters
+            .iter()
+            .map(|(_, rc)| rc.bottom)
+            .max()
+            .unwrap_or(content_top)
+    };
+    let eng_top = last_kb_bottom + SIMPLEX_GAP;
+    let eng_bottom = action_top - SIMPLEX_GAP;
+    let eng_avail = (eng_bottom - eng_top).max(1);
+    let english_h = ((eng_avail - 2 * SIMPLEX_GAP) / 3).clamp(ENGLISH_ROW_MIN_H, ENGLISH_ROW_MAX_H);
+    let en_key_w = ((usable - 9 * KEY_GAP) / 10).max(14);
+    let unit = en_key_w + KEY_GAP;
+    let block_w = en_key_w * 10 + KEY_GAP * 9;
+    let x_base = left + (usable - block_w).max(0) / 2;
+    let mut english = Vec::new();
+    for (i, row_chars) in ENGLISH_ROWS.iter().enumerate() {
+        let row_top = eng_top + (i as i32) * (english_h + SIMPLEX_GAP);
+        let indent = match i {
+            1 => unit / 2,
+            2 => unit,
+            _ => 0,
+        };
+        for (j, ch) in row_chars.iter().copied().enumerate() {
+            let x = x_base + indent + (j as i32) * unit;
+            english.push((
+                ch,
+                RECT {
+                    left: x,
+                    top: row_top,
+                    right: x + en_key_w,
+                    bottom: row_top + english_h,
+                },
+            ));
+        }
+    }
+
+    SimplexLayout {
+        digits,
+        backspace,
+        puncts,
+        navs,
+        letters,
+        symbols,
+        actions,
+        english,
+        letter_h,
+        english_h,
+    }
 }
 
 impl AppState {
@@ -483,30 +688,46 @@ impl AppState {
                     return Some(Hit::Candidate(i as u8));
                 }
             }
-            let kb = Self::keyboard_rect(client);
-            if self.symbols_open {
-                let (keys, actions) = symbol_key_rects(kb);
-                for (hit, _, rc) in &actions {
-                    if pt_in(*rc, x, y) {
-                        return Some(*hit);
-                    }
+            let layout = simplex_layout(client, self.symbols_open);
+            if pt_in(layout.backspace, x, y) {
+                return Some(Hit::Backspace);
+            }
+            for (ch, rc) in &layout.digits {
+                if pt_in(*rc, x, y) {
+                    return Some(Hit::Digit(*ch));
                 }
-                for (ch, rc, _) in keys {
+            }
+            for (ch, rc) in &layout.puncts {
+                if pt_in(*rc, x, y) {
+                    return Some(Hit::Punct(*ch));
+                }
+            }
+            for (nav, rc) in &layout.navs {
+                if pt_in(*rc, x, y) {
+                    return Some(Hit::Nav(*nav));
+                }
+            }
+            for (hit, _, rc) in &layout.actions {
+                if pt_in(*rc, x, y) {
+                    return Some(*hit);
+                }
+            }
+            if self.symbols_open {
+                for (ch, rc, _) in layout.symbols {
                     if pt_in(rc, x, y) {
                         return Some(Hit::Symbol(ch));
                     }
                 }
             } else {
-                let (letters, actions) = letter_key_rects(kb);
-                for (hit, _, rc) in &actions {
-                    if pt_in(*rc, x, y) {
-                        return Some(*hit);
-                    }
-                }
-                for (ch, rc) in letters {
+                for (ch, rc) in layout.letters {
                     if pt_in(rc, x, y) {
                         return Some(Hit::Letter(ch));
                     }
+                }
+            }
+            for (ch, rc) in layout.english {
+                if pt_in(rc, x, y) {
+                    return Some(Hit::Latin(ch));
                 }
             }
             return None;
@@ -531,13 +752,12 @@ impl AppState {
     }
 
     unsafe fn ensure_fonts(&mut self, client: RECT) {
-        let key_h = if self.mode == Mode::Cp437 {
+        let (key_h, english_h) = if self.mode == Mode::Cp437 {
             let grid = Self::grid_rect(client);
-            ((grid.bottom - grid.top) / ROWS).max(1)
+            (((grid.bottom - grid.top) / ROWS).max(1), 0)
         } else {
-            let kb = Self::keyboard_rect(client);
-            let rows = if self.symbols_open { 5 } else { 4 };
-            ((kb.bottom - kb.top) / rows).max(1)
+            let layout = simplex_layout(client, self.symbols_open);
+            (layout.letter_h.max(1), layout.english_h.max(1))
         };
         let cand_h = CANDIDATE_ROW_H;
         let mode_tag = match (self.mode, self.symbols_open) {
@@ -545,7 +765,7 @@ impl AppState {
             (Mode::Simplex, false) => 1,
             (Mode::Simplex, true) => 2,
         };
-        let key = (key_h, cand_h, mode_tag);
+        let key = (key_h, cand_h, english_h, mode_tag);
         if key == self.font_key && handle_nonzero(self.fonts.glyph) {
             return;
         }
@@ -553,12 +773,18 @@ impl AppState {
         self.font_key = key;
         let glyph_h = (key_h as f32 * 0.46).round() as i32;
         let caption_h = (key_h as f32 * 0.20).round() as i32;
-        let named_h = (key_h as f32 * 0.26).round() as i32;
+        let named_h = if self.mode == Mode::Simplex {
+            (ACTION_ROW_H as f32 * 0.50).round() as i32
+        } else {
+            (key_h as f32 * 0.26).round() as i32
+        };
         let status = Self::status_h(client.bottom - client.top);
         let status_font_h = (status as f32 * 0.48).round() as i32;
-        let radical_h = (key_h as f32 * 0.42).round() as i32;
-        let letter_h = (key_h as f32 * 0.22).round() as i32;
-        let cand_font_h = ((cand_h - 8) as f32 * 0.62).round() as i32;
+        // Keep radicals inside the key: modest ratio and a hard cap, plus a
+        // reserved band for the letter so the two never collide.
+        let radical_h = (key_h as f32 * 0.34).round() as i32;
+        let letter_h = (key_h as f32 * 0.18).round() as i32;
+        let cand_font_h = ((cand_h - 8) as f32 * 0.58).round() as i32;
         self.fonts.glyph = create_font(
             "Segoe UI Symbol",
             glyph_h.clamp(11, 72),
@@ -567,7 +793,11 @@ impl AppState {
         self.fonts.caption = create_font("Segoe UI", caption_h.clamp(9, 22), FW_NORMAL.0 as i32);
         self.fonts.named = create_font(
             "Microsoft JhengHei",
-            named_h.clamp(10, 28),
+            if self.mode == Mode::Simplex {
+                named_h.clamp(10, 14)
+            } else {
+                named_h.clamp(10, 28)
+            },
             FW_SEMIBOLD.0 as i32,
         );
         self.fonts.status = create_font(
@@ -577,23 +807,29 @@ impl AppState {
         );
         self.fonts.radical = create_font(
             "Microsoft JhengHei",
-            radical_h.clamp(11, 48),
+            radical_h.clamp(11, 22),
             FW_SEMIBOLD.0 as i32,
         );
-        self.fonts.letter = create_font("Segoe UI", letter_h.clamp(8, 22), FW_NORMAL.0 as i32);
+        self.fonts.letter = create_font("Segoe UI", letter_h.clamp(8, 12), FW_NORMAL.0 as i32);
+        let english_font_h = (english_h as f32 * 0.46).round() as i32;
+        self.fonts.english = create_font(
+            "Segoe UI",
+            english_font_h.clamp(10, 20),
+            FW_SEMIBOLD.0 as i32,
+        );
         self.fonts.cand_jhenghei = create_font(
             "Microsoft JhengHei",
-            cand_font_h.clamp(14, 40),
+            cand_font_h.clamp(13, 32),
             FW_SEMIBOLD.0 as i32,
         );
         self.fonts.cand_hkscs = create_font(
             "MingLiU_HKSCS",
-            cand_font_h.clamp(14, 40),
+            cand_font_h.clamp(13, 32),
             FW_SEMIBOLD.0 as i32,
         );
         self.fonts.cand_extb = create_font(
             "MingLiU_HKSCS-ExtB",
-            cand_font_h.clamp(14, 40),
+            cand_font_h.clamp(13, 32),
             FW_SEMIBOLD.0 as i32,
         );
     }
@@ -610,6 +846,7 @@ impl Drop for AppState {
                 HGDIOBJ(self.brushes.hover.0),
                 HGDIOBJ(self.brushes.pressed.0),
                 HGDIOBJ(self.brushes.special.0),
+                HGDIOBJ(self.brushes.english.0),
                 HGDIOBJ(self.brushes.selected.0),
                 HGDIOBJ(self.brushes.disabled.0),
                 HGDIOBJ(self.brushes.border.0),
@@ -764,6 +1001,11 @@ fn commit_char(state: &mut AppState, ch: char) {
 fn activate_hit(hwnd: HWND, state: &mut AppState, hit: Hit) {
     match hit {
         Hit::Cp437(0) => {}
+        Hit::Cp437(32) => {
+            // The Alt+32 cell is labelled BS and sends Backspace, not a space.
+            let _ = send_vk(VK_BACK, false);
+            state.last_typed_cp437 = Some(32);
+        }
         Hit::Cp437(code) => {
             if let Some(ch) = cp437::glyph(code) {
                 let _ = send_unicode(ch);
@@ -778,7 +1020,7 @@ fn activate_hit(hwnd: HWND, state: &mut AppState, hit: Hit) {
                 state.codes.clear();
                 state.page = 0;
                 state.hover = None;
-                state.font_key = (0, 0, 255);
+                state.font_key = (0, 0, 0, 255);
                 set_title(hwnd, mode);
                 apply_mode_min_size(hwnd, state);
             }
@@ -826,11 +1068,21 @@ fn activate_hit(hwnd: HWND, state: &mut AppState, hit: Hit) {
         Hit::SymbolToggle => {
             state.symbols_open = !state.symbols_open;
             state.page = 0;
-            state.font_key = (0, 0, 255);
+            state.font_key = (0, 0, 0, 255);
         }
         Hit::Symbol(ch) => {
             let _ = send_unicode(ch);
             state.last_typed = Some(ch);
+        }
+        Hit::Digit(ch) | Hit::Punct(ch) | Hit::Latin(ch) => {
+            let _ = send_unicode(ch);
+            state.last_typed = Some(ch);
+        }
+        Hit::Nav(nav) => {
+            let _ = send_vk(nav.vk(), true);
+        }
+        Hit::Backspace => {
+            let _ = send_vk(VK_BACK, false);
         }
     }
 }
@@ -1006,7 +1258,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 );
             }
             if let Some(state) = state_mut(hwnd) {
-                state.font_key = (0, 0, 255);
+                state.font_key = (0, 0, 0, 255);
             }
             let _ = InvalidateRect(hwnd, None, false);
             LRESULT(0)
@@ -1016,7 +1268,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 schedule_save(hwnd);
             }
             if let Some(state) = state_mut(hwnd) {
-                state.font_key = (0, 0, 255);
+                state.font_key = (0, 0, 0, 255);
             }
             let _ = InvalidateRect(hwnd, None, false);
             LRESULT(0)
@@ -1150,6 +1402,44 @@ fn send_unicode(ch: char) -> WinResult<()> {
             Anonymous: INPUT_0 { ki: ki_up },
         });
     }
+    let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+    if sent as usize != inputs.len() {
+        return Err(windows::core::Error::from_win32());
+    }
+    Ok(())
+}
+
+fn send_vk(vk: VIRTUAL_KEY, extended: bool) -> WinResult<()> {
+    let scan = unsafe { MapVirtualKeyW(u32::from(vk.0), MAPVK_VK_TO_VSC) } as u16;
+    let extra = if extended {
+        KEYEVENTF_EXTENDEDKEY
+    } else {
+        Default::default()
+    };
+    let ki_down = KEYBDINPUT {
+        wVk: vk,
+        wScan: scan,
+        dwFlags: extra,
+        time: 0,
+        dwExtraInfo: 0,
+    };
+    let ki_up = KEYBDINPUT {
+        wVk: vk,
+        wScan: scan,
+        dwFlags: extra | KEYEVENTF_KEYUP,
+        time: 0,
+        dwExtraInfo: 0,
+    };
+    let inputs = [
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 { ki: ki_down },
+        },
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 { ki: ki_up },
+        },
+    ];
     let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
     if sent as usize != inputs.len() {
         return Err(windows::core::Error::from_win32());
@@ -1298,6 +1588,15 @@ fn hint_text(state: &AppState) -> String {
                 Some(Hit::Cp437(c)) => Some(c),
                 _ => state.last_typed_cp437,
             } {
+                if code == 32 {
+                    let text = "BS  ·  Backspace  ·  刪除先前聚焦視窗嘅一個字元";
+                    if state.last_typed_cp437 == Some(32)
+                        && !matches!(state.hover, Some(Hit::Cp437(_)))
+                    {
+                        return format!("已輸入  ·  {text}");
+                    }
+                    return text.to_string();
+                }
                 let text = cp437::hint_text(code);
                 if state.last_typed_cp437 == Some(code)
                     && !matches!(state.hover, Some(Hit::Cp437(_)))
@@ -1314,22 +1613,36 @@ fn hint_text(state: &AppState) -> String {
                 "置頂 · 唔會搶焦點 · 點擊按鍵輸入到先前聚焦嘅視窗 · 拖曳邊緣可調整大小".to_string()
             }
         }
-        Mode::Simplex if state.symbols_open => {
-            "符號 · 對齊微軟倉頡／速成 Ctrl+Alt+, 符號鍵盤 · 點符號輸入到先前聚焦視窗".to_string()
-        }
-        Mode::Simplex => {
-            if let Some(Hit::Letter(ch)) = state.hover {
+        Mode::Simplex => match state.hover {
+            Some(Hit::Letter(ch)) => {
                 let rad = simplex::radical_for(ch).unwrap_or('?');
                 format!(
                     "速成  ·  {rad} {}  ·  最多兩碼（首尾）",
                     ch.to_ascii_uppercase()
                 )
-            } else if let Some(ch) = state.last_typed {
-                format!("已輸入  ·  {ch}")
-            } else {
-                "速成 · 最多兩碼（首尾）· 點候選或空格上字到先前聚焦視窗".to_string()
             }
-        }
+            Some(Hit::Latin(ch)) => {
+                format!("英文  ·  {ch}  ·  輸入到先前聚焦視窗（唔係速成碼）")
+            }
+            Some(Hit::Digit(ch)) | Some(Hit::Punct(ch)) => {
+                format!("點擊輸入  ·  {ch}  到先前聚焦視窗")
+            }
+            Some(Hit::Nav(nav)) => {
+                format!("{}  ·  送到先前聚焦視窗", nav.label())
+            }
+            Some(Hit::Backspace) => {
+                "Bksp  ·  Backspace  ·  刪除先前聚焦視窗嘅一個字元（唔改速成編碼）".to_string()
+            }
+            Some(Hit::Delete) => "刪  ·  刪除一個速成碼".to_string(),
+            _ if state.symbols_open => {
+                "符號 · 對齊微軟倉頡／速成 Ctrl+Alt+, 符號鍵盤 · 點符號輸入到先前聚焦視窗"
+                    .to_string()
+            }
+            _ if state.last_typed.is_some() => {
+                format!("已輸入  ·  {}", state.last_typed.unwrap())
+            }
+            _ => "速成 · 最多兩碼（首尾）· 點候選或空格上字到先前聚焦視窗".to_string(),
+        },
     }
 }
 
@@ -1402,24 +1715,73 @@ unsafe fn draw_simplex(hdc: HDC, state: &AppState, client: RECT) {
     draw_page_btn(hdc, state, prev, Hit::PagePrev, prev_label, can_prev);
     draw_page_btn(hdc, state, next, Hit::PageNext, next_label, can_next);
 
-    let kb = AppState::keyboard_rect(client);
+    let layout = simplex_layout(client, state.symbols_open);
+    for (ch, rc) in &layout.digits {
+        draw_labeled_key(hdc, state, *rc, &ch.to_string(), Hit::Digit(*ch), false);
+    }
+    draw_labeled_key(hdc, state, layout.backspace, "Bksp", Hit::Backspace, true);
+    for (ch, rc) in &layout.puncts {
+        draw_labeled_key(hdc, state, *rc, &ch.to_string(), Hit::Punct(*ch), false);
+    }
+    for (nav, rc) in &layout.navs {
+        draw_labeled_key(hdc, state, *rc, nav.label(), Hit::Nav(*nav), false);
+    }
     if state.symbols_open {
-        let (keys, actions) = symbol_key_rects(kb);
-        for (ch, rc, keycap) in keys {
+        for (ch, rc, keycap) in layout.symbols {
             draw_symbol_key(hdc, state, rc, ch, keycap, Hit::Symbol(ch));
         }
-        for (hit, label, rc) in actions {
-            draw_action_key(hdc, state, rc, label, hit);
-        }
     } else {
-        let (letters, actions) = letter_key_rects(kb);
-        for (ch, rc) in letters {
+        for (ch, rc) in layout.letters {
             draw_letter_key(hdc, state, rc, ch);
         }
-        for (hit, label, rc) in actions {
-            draw_action_key(hdc, state, rc, label, hit);
-        }
     }
+    for (ch, rc) in layout.english {
+        draw_english_key(hdc, state, rc, ch);
+    }
+    for (hit, label, rc) in layout.actions {
+        draw_action_key(hdc, state, rc, label, hit);
+    }
+}
+
+unsafe fn draw_labeled_key(
+    hdc: HDC,
+    state: &AppState,
+    rc: RECT,
+    label: &str,
+    hit: Hit,
+    special: bool,
+) {
+    if rc.right - rc.left < 4 || rc.bottom - rc.top < 4 {
+        return;
+    }
+    let brush = if state.pressed == Some(hit) {
+        state.brushes.pressed
+    } else if state.hover == Some(hit) {
+        state.brushes.hover
+    } else if special {
+        state.brushes.special
+    } else {
+        state.brushes.key
+    };
+    let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
+    let radius = ((rc.bottom - rc.top).min(rc.right - rc.left) / 6).clamp(2, 8);
+    let _ = RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
+    SelectObject(hdc, old_brush);
+    let _ = SelectObject(hdc, HGDIOBJ(state.fonts.status.0));
+    SetTextColor(hdc, rgb(0xF4, 0xF5, 0xF8));
+    let mut text: Vec<u16> = label.encode_utf16().collect();
+    let mut tr = RECT {
+        left: rc.left + 1,
+        top: rc.top,
+        right: rc.right - 1,
+        bottom: rc.bottom,
+    };
+    DrawTextW(
+        hdc,
+        &mut text,
+        &mut tr,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+    );
 }
 
 unsafe fn draw_page_btn(
@@ -1461,6 +1823,39 @@ unsafe fn draw_page_btn(
     );
 }
 
+unsafe fn draw_english_key(hdc: HDC, state: &AppState, rc: RECT, letter: char) {
+    if rc.right - rc.left < 4 || rc.bottom - rc.top < 4 {
+        return;
+    }
+    let hit = Hit::Latin(letter);
+    let brush = if state.pressed == Some(hit) {
+        state.brushes.pressed
+    } else if state.hover == Some(hit) {
+        state.brushes.hover
+    } else {
+        state.brushes.english
+    };
+    let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
+    let radius = ((rc.bottom - rc.top).min(rc.right - rc.left) / 6).clamp(2, 8);
+    let _ = RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
+    SelectObject(hdc, old_brush);
+    let _ = SelectObject(hdc, HGDIOBJ(state.fonts.english.0));
+    SetTextColor(hdc, rgb(0xB8, 0xE4, 0xD8));
+    let mut text = utf16_char(letter);
+    let mut tr = RECT {
+        left: rc.left + 1,
+        top: rc.top,
+        right: rc.right - 1,
+        bottom: rc.bottom,
+    };
+    DrawTextW(
+        hdc,
+        &mut text,
+        &mut tr,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+    );
+}
+
 unsafe fn draw_letter_key(hdc: HDC, state: &AppState, rc: RECT, letter: char) {
     if rc.right - rc.left < 4 || rc.bottom - rc.top < 4 {
         return;
@@ -1481,20 +1876,19 @@ unsafe fn draw_letter_key(hdc: HDC, state: &AppState, rc: RECT, letter: char) {
     let rad = simplex::radical_for(letter).unwrap_or(letter);
     let cap = letter.to_ascii_uppercase();
     let h = rc.bottom - rc.top;
-    // Always show both radical and letter, even on a tight window.
-    let split = if h >= 28 {
-        (h as f32 * 0.62) as i32
-    } else {
-        (h as f32 * 0.58) as i32
-    };
+    let w = rc.right - rc.left;
+    // Reserved letter band + inner padding so the radical never clips the
+    // key edge or collides with the Latin letter.
+    let pad = 3.max((h.min(w) / 16).min(5));
+    let letter_band = (h * 30 / 100).clamp(11, 16);
     let mut rad_wide: Vec<u16> = utf16_char(rad);
     let _ = SelectObject(hdc, HGDIOBJ(state.fonts.radical.0));
     SetTextColor(hdc, rgb(0xF4, 0xF5, 0xF8));
     let mut rad_rc = RECT {
-        left: rc.left + 1,
-        top: rc.top + 1,
-        right: rc.right - 1,
-        bottom: rc.top + split,
+        left: rc.left + pad,
+        top: rc.top + pad,
+        right: rc.right - pad,
+        bottom: (rc.bottom - letter_band).max(rc.top + pad + 8),
     };
     DrawTextW(
         hdc,
@@ -1507,7 +1901,7 @@ unsafe fn draw_letter_key(hdc: HDC, state: &AppState, rc: RECT, letter: char) {
     SetTextColor(hdc, rgb(0x9A, 0xA4, 0xB8));
     let mut cap_rc = RECT {
         left: rc.left + 1,
-        top: rad_rc.bottom - 1,
+        top: rad_rc.bottom,
         right: rc.right - 1,
         bottom: rc.bottom - 1,
     };
@@ -1632,9 +2026,13 @@ unsafe fn draw_cp437_key(hdc: HDC, state: &AppState, client: RECT, code: u8) {
     SelectObject(hdc, old_brush);
 
     let h = rc.bottom - rc.top;
-    let show_caption = h >= 30 && code != 0;
-    let named = code == 0 || cp437::is_named_blank(code);
-    let label = cp437::display_label(code);
+    let show_caption = h >= 30 && code != 0 && code != 32;
+    let named = code == 0 || code == 32 || cp437::is_named_blank(code);
+    let label = if code == 32 {
+        "BS".to_string()
+    } else {
+        cp437::display_label(code)
+    };
     let mut label_wide: Vec<u16> = label.encode_utf16().collect();
 
     if named {
