@@ -102,7 +102,7 @@ pub(super) fn hit_name(state: &AppState, hit: Hit) -> String {
                 "Backspace".to_string()
             }
         }
-        Hit::Delete => "刪, delete one code".to_string(),
+        Hit::Delete => "刪碼, delete one code".to_string(),
         Hit::Clear => "清除, clear codes".to_string(),
         Hit::Space => "空格, type first candidate".to_string(),
         Hit::SymbolToggle => "符號, symbols".to_string(),

@@ -19,6 +19,7 @@ use on99kb::{cp437, prefs, simplex};
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use windows::core::{w, Result as WinResult, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -26,14 +27,16 @@ use windows::Win32::Graphics::Gdi::{
     CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetGlyphIndicesW,
     GetStockObject, IntersectClipRect, InvalidateRect, RoundRect, ScreenToClient, SelectClipRgn,
     SelectObject, SetBkMode, SetTextColor, BLACK_BRUSH, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
-    DEFAULT_CHARSET, DEFAULT_PITCH, DT_CENTER, DT_END_ELLIPSIS, DT_SINGLELINE, DT_VCENTER,
-    FF_DONTCARE, FW_NORMAL, FW_SEMIBOLD, GGI_MARK_NONEXISTING_GLYPHS, HBITMAP, HBRUSH, HDC, HFONT,
-    HGDIOBJ, HPEN, HRGN, OUT_TT_PRECIS, PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
+    DEFAULT_CHARSET, DEFAULT_PITCH, DT_CENTER, DT_END_ELLIPSIS, DT_NOCLIP, DT_RIGHT, DT_SINGLELINE,
+    DT_TOP, DT_VCENTER, FF_DONTCARE, FW_NORMAL, FW_SEMIBOLD, GGI_MARK_NONEXISTING_GLYPHS, HBITMAP,
+    HBRUSH, HDC, HFONT, HGDIOBJ, HPEN, HRGN, OUT_TT_PRECIS, PAINTSTRUCT, PS_INSIDEFRAME, PS_SOLID,
+    SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
-    SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    AdjustWindowRectExForDpi, GetDpiForWindow, SetProcessDpiAwarenessContext,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     MapVirtualKeyW, ReleaseCapture, SendInput, SetCapture, TrackMouseEvent, INPUT, INPUT_0,
@@ -43,20 +46,20 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
 use windows::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetClientRect, GetCursorPos, GetMessageW, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect,
-    IsIconic, KillTimer, LoadCursorW, LoadImageW, MessageBoxW, MoveWindow, PostQuitMessage,
-    RegisterClassExW, SetCursor, SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW,
-    SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW,
-    CW_USEDEFAULT, GWLP_USERDATA, HICON, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, IDC_HAND,
-    IMAGE_ICON, LR_DEFAULTCOLOR, LR_DEFAULTSIZE, LWA_ALPHA, MA_NOACTIVATE, MB_ICONERROR, MB_OK,
-    MINMAXINFO, MSG, SM_CXSMICON, SM_CXVIRTUALSCREEN, SM_CYSMICON, SM_CYVIRTUALSCREEN,
-    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    SW_SHOWNOACTIVATE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_DESTROY, WM_DPICHANGED,
-    WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_GETOBJECT, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_PAINT, WM_SETCURSOR, WM_SIZE,
-    WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_EX_APPWINDOW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOPMOST, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetCursorPos,
+    GetMessageW, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, IsIconic, KillTimer,
+    LoadCursorW, LoadImageW, MessageBoxW, MoveWindow, PostQuitMessage, RegisterClassExW, SetCursor,
+    SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW,
+    ShowWindow, TranslateMessage, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA,
+    HICON, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, IDC_HAND, IMAGE_ICON, LR_DEFAULTCOLOR,
+    LR_DEFAULTSIZE, LWA_ALPHA, MA_NOACTIVATE, MB_ICONERROR, MB_OK, MINMAXINFO, MSG, SM_CXSMICON,
+    SM_CXVIRTUALSCREEN, SM_CYSMICON, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNOACTIVATE, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_EXITSIZEMOVE,
+    WM_GETMINMAXINFO, WM_GETOBJECT, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_MOVE, WM_PAINT, WM_SETCURSOR, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_CAPTION,
+    WS_EX_APPWINDOW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_MINIMIZEBOX, WS_POPUP,
+    WS_SYSMENU, WS_THICKFRAME,
 };
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
@@ -75,7 +78,14 @@ const MODE_SEG_W: i32 = 62;
 const OPACITY_BTN_W: i32 = 50;
 const SPACE_BAR_MIN_W: i32 = 96;
 const SPACE_BAR_MAX_W: i32 = 280;
-const HINT_RESERVE_W: i32 = 88;
+/// Dedicated full-width row above the control bar for the hint text, so it
+/// is never squeezed into the space left beside the Space bar.
+/// This is its minimum height; it grows with the status font.
+const HINT_ROW_MIN_H: i32 = 20;
+/// Below this key height the CP437 caption shrinks to the bare number.
+const CP437_FULL_CAPTION_H: i32 = 30;
+const CP437_COMPACT_CAPTION_H: i32 = 20;
+const CP437_COMPACT_CAPTION_BAND: i32 = 9;
 const ICON_RESOURCE_ID: u16 = 1;
 const AUX_ROW_H: i32 = 28;
 const LETTER_ROW_MIN_H: i32 = 46;
@@ -84,6 +94,50 @@ const ACTION_ROW_H: i32 = 26;
 const SIMPLEX_GAP: i32 = 3;
 const ENGLISH_ROW_MIN_H: i32 = 22;
 const ENGLISH_ROW_MAX_H: i32 = 54;
+
+/// Layout constants above (and the minimum client size in `prefs`) are in
+/// device-independent pixels at 96 DPI (100%). Everything is scaled to the
+/// window's current DPI with [`dp`] at the point of use, so the keyboard looks
+/// the same at 100%, 150% and 200% and follows the window across monitors.
+const BASE_DPI: u32 = 96;
+static WINDOW_DPI: AtomicU32 = AtomicU32::new(BASE_DPI);
+
+fn current_dpi() -> u32 {
+    WINDOW_DPI.load(Ordering::Relaxed)
+}
+
+fn set_current_dpi(dpi: u32) {
+    let dpi = if dpi == 0 { BASE_DPI } else { dpi };
+    WINDOW_DPI.store(dpi, Ordering::Relaxed);
+}
+
+fn scale_by(v: i32, num: u32, den: u32) -> i32 {
+    ((v as i64 * num as i64 * 2 + den as i64 * v.signum() as i64) / (den as i64 * 2)) as i32
+}
+
+/// 96-DPI design pixels → physical pixels at the window's current DPI.
+fn dp(v: i32) -> i32 {
+    scale_by(v, current_dpi(), BASE_DPI)
+}
+
+/// Physical pixels at the window's current DPI → 96-DPI design pixels.
+fn undp(v: i32) -> i32 {
+    scale_by(v, BASE_DPI, current_dpi())
+}
+
+/// Window size for a client size, using the frame metrics of `dpi`.
+fn window_size_for_client(client_w: i32, client_h: i32, dpi: u32) -> (i32, i32) {
+    let mut wr = RECT {
+        left: 0,
+        top: 0,
+        right: client_w,
+        bottom: client_h,
+    };
+    unsafe {
+        let _ = AdjustWindowRectExForDpi(&mut wr, APP_STYLE, false, APP_EX_STYLE_BASE, dpi);
+    }
+    (wr.right - wr.left, wr.bottom - wr.top)
+}
 
 const DIGIT_CHARS: [char; 10] = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '0'];
 const PUNCT_CHARS: [char; 4] = ['，', '。', '：', '；'];
@@ -116,8 +170,8 @@ fn latin_shifted_char(ch: char) -> char {
     }
 }
 
-fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
-    COLORREF(u32::from(r) | (u32::from(g) << 8) | (u32::from(b) << 16))
+const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
+    COLORREF(r as u32 | ((g as u32) << 8) | ((b as u32) << 16))
 }
 
 fn point_from_lparam(lparam: LPARAM) -> (i32, i32) {
@@ -148,8 +202,8 @@ fn rects_overlap(a: RECT, b: RECT) -> bool {
     a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
 }
 
-/// Repaint just the keys whose hover/pressed look changed, plus the status
-/// hint (its text follows hover). Falls back to a full repaint if a key's
+/// Repaint just the keys whose hover/pressed look changed, plus the hint
+/// row above the control bar (its text follows hover). Falls back to a full repaint if a key's
 /// rect is unknown.
 fn invalidate_hits(hwnd: HWND, state: &AppState, hits: &[Option<Hit>]) {
     let client = client_rect(hwnd);
@@ -157,12 +211,14 @@ fn invalidate_hits(hwnd: HWND, state: &AppState, hits: &[Option<Hit>]) {
         for hit in hits.iter().flatten() {
             match state.hit_rect(client, *hit) {
                 Some(rc) => {
-                    // Rounded-rect outlines sit on the edge; pad by 1 px.
+                    // Rounded-rect outlines sit on the edge; pad a little,
+                    // scaled so 150% / 200% outlines are covered too.
+                    let pad = dp(2).max(1);
                     let rc = RECT {
-                        left: rc.left - 1,
-                        top: rc.top - 1,
-                        right: rc.right + 1,
-                        bottom: rc.bottom + 1,
+                        left: rc.left - pad,
+                        top: rc.top - pad,
+                        right: rc.right + pad,
+                        bottom: rc.bottom + pad,
                     };
                     let _ = InvalidateRect(hwnd, Some(&rc), false);
                 }
@@ -327,6 +383,47 @@ struct Brushes {
     selected: HBRUSH,
     disabled: HBRUSH,
     border: HPEN,
+    /// Outline for controls that act on the window or the target app
+    /// (topmost toggle, Backspace, opacity) rather than typing a character.
+    control_pen: HPEN,
+    /// Outline for keys that act on the 速成 composition (刪碼 / 清除 / 空格 / 符號).
+    compose_pen: HPEN,
+}
+
+/// Which outline a key gets, so controls never read as plain typing keys.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Accent {
+    None,
+    Control,
+    Compose,
+}
+
+const CONTROL_TEXT: COLORREF = rgb(0xF0, 0xC8, 0x78);
+const COMPOSE_TEXT: COLORREF = rgb(0x8E, 0xC8, 0xFF);
+const HOLD_MARK_TEXT: COLORREF = rgb(0x6E, 0x9E, 0x94);
+
+/// Draw a key body; accented keys get a 2px inside outline instead of the
+/// near-invisible default border.
+unsafe fn draw_key_body(
+    hdc: HDC,
+    state: &AppState,
+    rc: RECT,
+    radius: i32,
+    brush: HBRUSH,
+    accent: Accent,
+) {
+    let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
+    let pen = match accent {
+        Accent::None => None,
+        Accent::Control => Some(state.brushes.control_pen),
+        Accent::Compose => Some(state.brushes.compose_pen),
+    };
+    let old_pen = pen.map(|p| SelectObject(hdc, HGDIOBJ(p.0)));
+    let _ = RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
+    if let Some(old) = old_pen {
+        SelectObject(hdc, old);
+    }
+    SelectObject(hdc, old_brush);
 }
 
 struct AppState {
@@ -345,15 +442,16 @@ struct AppState {
     fonts: Fonts,
     brushes: Brushes,
     font_key: (i32, i32, i32, u8),
-    /// 速成 layout for the last (width, height, symbols_open). Rebuilt only
-    /// when one of those changes, so hover / hit-test / paint don't allocate.
+    /// 速成 layout for the last (width, height, DPI, symbols_open). Rebuilt
+    /// only when one of those changes, so hover / hit-test / paint don't allocate.
     simplex_cache: RefCell<Option<(LayoutKey, Rc<SimplexLayout>)>>,
     /// Off-screen buffer kept across paints so only dirty rects are redrawn.
     backbuf: Option<BackBuffer>,
 }
 
-/// (client width, client height, symbols_open).
-type LayoutKey = (i32, i32, bool);
+/// (client width, client height, window DPI, symbols_open). DPI is part of
+/// the key because every row height and gap is scaled with `dp`.
+type LayoutKey = (i32, i32, u32, bool);
 
 /// Persistent memory DC + bitmap for double buffering. Recreated on resize.
 struct BackBuffer {
@@ -400,6 +498,8 @@ impl AppState {
                     selected: CreateSolidBrush(rgb(0x1E, 0x6E, 0xBE)),
                     disabled: CreateSolidBrush(rgb(0x1A, 0x1C, 0x22)),
                     border: CreatePen(PS_SOLID, 1, rgb(0x18, 0x1A, 0x20)),
+                    control_pen: CreatePen(PS_INSIDEFRAME, dp(2).max(1), rgb(0xB0, 0x86, 0x3C)),
+                    compose_pen: CreatePen(PS_INSIDEFRAME, dp(2).max(1), rgb(0x3E, 0x6E, 0xA8)),
                 },
                 font_key: (0, 0, 0, 255),
                 simplex_cache: RefCell::new(None),
@@ -410,13 +510,24 @@ impl AppState {
 
     fn min_client(&self) -> (i32, i32) {
         match self.mode {
-            Mode::Cp437 => (prefs::MIN_CLIENT_W, prefs::MIN_CLIENT_H),
-            Mode::Simplex => (prefs::MIN_CLIENT_W, simplex_min_client_h()),
+            Mode::Cp437 => (dp(prefs::MIN_CLIENT_W), dp(prefs::MIN_CLIENT_H)),
+            Mode::Simplex => (dp(prefs::MIN_CLIENT_W), simplex_min_client_h()),
         }
     }
 
     fn status_h(client_h: i32) -> i32 {
-        (client_h / 18).clamp(28, 44)
+        (client_h / 18).clamp(dp(28), dp(44))
+    }
+
+    /// Height of the whole footer: hint row plus control bar.
+    fn footer_h(client_h: i32) -> i32 {
+        Self::status_h(client_h) + Self::hint_row_h(client_h)
+    }
+
+    /// Tall enough for the status font (about 0.48 × status height).
+    fn hint_row_h(client_h: i32) -> i32 {
+        let status = Self::status_h(client_h) as f32;
+        ((status * 0.62).round() as i32).clamp(dp(HINT_ROW_MIN_H), dp(28))
     }
 
     fn status_rect(client: RECT) -> RECT {
@@ -431,20 +542,21 @@ impl AppState {
 
     fn mode_segment_rect(client: RECT, which: Mode) -> RECT {
         let status = Self::status_rect(client);
-        let y0 = status.top + 3;
-        let y1 = status.bottom - 3;
-        let x0 = status.left + 8;
+        let y0 = status.top + dp(3);
+        let y1 = status.bottom - dp(3);
+        let x0 = status.left + dp(8);
+        let seg_w = dp(MODE_SEG_W);
         match which {
             Mode::Cp437 => RECT {
                 left: x0,
                 top: y0,
-                right: x0 + MODE_SEG_W,
+                right: x0 + seg_w,
                 bottom: y1,
             },
             Mode::Simplex => RECT {
-                left: x0 + MODE_SEG_W,
+                left: x0 + seg_w,
                 top: y0,
-                right: x0 + MODE_SEG_W * 2,
+                right: x0 + seg_w * 2,
                 bottom: y1,
             },
         }
@@ -452,25 +564,24 @@ impl AppState {
 
     fn opacity_rect(client: RECT) -> RECT {
         let status = Self::status_rect(client);
-        let y0 = status.top + 3;
-        let y1 = status.bottom - 3;
-        let x0 = status.left + 8 + MODE_SEG_W * 2 + 8;
+        let y0 = status.top + dp(3);
+        let y1 = status.bottom - dp(3);
+        let x0 = status.left + dp(8 + MODE_SEG_W * 2 + 8);
         RECT {
             left: x0,
             top: y0,
-            right: x0 + OPACITY_BTN_W,
+            right: x0 + dp(OPACITY_BTN_W),
             bottom: y1,
         }
     }
 
     fn space_bar_rect(client: RECT) -> RECT {
         let status = Self::status_rect(client);
-        let y0 = status.top + 3;
-        let y1 = status.bottom - 3;
-        let x0 = Self::opacity_rect(client).right + 8;
-        let hint_and_margin = 12 + HINT_RESERVE_W + 8;
-        let avail = (status.right - hint_and_margin - x0).max(SPACE_BAR_MIN_W);
-        let space_w = avail.clamp(SPACE_BAR_MIN_W, SPACE_BAR_MAX_W);
+        let y0 = status.top + dp(3);
+        let y1 = status.bottom - dp(3);
+        let x0 = Self::opacity_rect(client).right + dp(8);
+        let avail = (status.right - dp(8) - x0).max(dp(SPACE_BAR_MIN_W));
+        let space_w = avail.clamp(dp(SPACE_BAR_MIN_W), dp(SPACE_BAR_MAX_W));
         RECT {
             left: x0,
             top: y0,
@@ -479,24 +590,35 @@ impl AppState {
         }
     }
 
+    /// Full-width hint row sitting directly above the control bar.
     fn hint_rect(client: RECT) -> RECT {
         let status = Self::status_rect(client);
-        let space = Self::space_bar_rect(client);
         RECT {
-            left: space.right + 8,
-            top: status.top,
-            right: status.right - 12,
-            bottom: status.bottom,
+            left: dp(12),
+            top: status.top - Self::hint_row_h(client.bottom - client.top),
+            right: (client.right - dp(12)).max(dp(12)),
+            bottom: status.top,
+        }
+    }
+
+    fn footer_rect(client: RECT) -> RECT {
+        let status = Self::status_rect(client);
+        RECT {
+            left: 0,
+            top: status.top - Self::hint_row_h(client.bottom - client.top),
+            right: client.right,
+            bottom: client.bottom,
         }
     }
 
     fn grid_rect(client: RECT) -> RECT {
-        let status = Self::status_h(client.bottom - client.top);
+        let status = Self::footer_h(client.bottom - client.top);
+        let pad = dp(GRID_PAD);
         RECT {
-            left: GRID_PAD,
-            top: GRID_PAD,
-            right: (client.right - GRID_PAD).max(GRID_PAD + 16),
-            bottom: (client.bottom - status - 2).max(GRID_PAD + 16),
+            left: pad,
+            top: pad,
+            right: (client.right - pad).max(pad + 16),
+            bottom: (client.bottom - status - dp(2)).max(pad + 16),
         }
     }
 
@@ -508,22 +630,23 @@ impl AppState {
         let row = (code as i32) / COLS;
         let cw = gw / COLS;
         let ch = gh / ROWS;
-        let left = grid.left + col * cw + KEY_GAP / 2;
-        let top = grid.top + row * ch + KEY_GAP / 2;
+        let gap = dp(KEY_GAP);
+        let left = grid.left + col * cw + gap / 2;
+        let top = grid.top + row * ch + gap / 2;
         RECT {
             left,
             top,
-            right: left + cw - KEY_GAP,
-            bottom: top + ch - KEY_GAP,
+            right: left + cw - gap,
+            bottom: top + ch - gap,
         }
     }
 
     fn candidate_band(client: RECT) -> RECT {
         RECT {
-            left: 6,
-            top: 4,
-            right: (client.right - 6).max(8),
-            bottom: CANDIDATE_ROW_H - 2,
+            left: dp(6),
+            top: dp(4),
+            right: (client.right - dp(6)).max(dp(8)),
+            bottom: dp(CANDIDATE_ROW_H - 2),
         }
     }
 
@@ -541,11 +664,11 @@ impl AppState {
 
 fn candidate_parts(client: RECT) -> (RECT, RECT, [RECT; 9], RECT, RECT) {
     let band = AppState::candidate_band(client);
-    let narrow = band.right - band.left < 430;
-    let page_w = if narrow { 28 } else { 36 };
-    let codes_w = if narrow { 78 } else { 100 };
-    let brand_w = if narrow { 52 } else { 58 };
-    let gap = if narrow { 2 } else { 3 };
+    let narrow = band.right - band.left < dp(430);
+    let page_w = dp(if narrow { 28 } else { 36 });
+    let codes_w = dp(if narrow { 78 } else { 100 });
+    let brand_w = dp(if narrow { 52 } else { 58 });
+    let gap = dp(if narrow { 2 } else { 3 });
     let next = RECT {
         left: band.right - page_w,
         top: band.top,
@@ -588,35 +711,40 @@ fn candidate_parts(client: RECT) -> (RECT, RECT, [RECT; 9], RECT, RECT) {
 }
 
 fn centered_keys(row: RECT, count: i32, key_w: i32) -> Vec<RECT> {
-    let total = count * key_w + (count - 1) * KEY_GAP;
+    let gap = dp(KEY_GAP);
+    let total = count * key_w + (count - 1) * gap;
     let x0 = row.left + ((row.right - row.left) - total).max(0) / 2;
     (0..count)
         .map(|i| RECT {
-            left: x0 + i * (key_w + KEY_GAP),
+            left: x0 + i * (key_w + gap),
             top: row.top,
-            right: x0 + i * (key_w + KEY_GAP) + key_w,
+            right: x0 + i * (key_w + gap) + key_w,
             bottom: row.bottom,
         })
         .collect()
 }
 
+/// Minimum 速成 client height in physical pixels at the current DPI. Each
+/// row is scaled on its own, exactly as `simplex_layout` does, so rounding
+/// can never leave the minimum a pixel or two short.
 fn simplex_min_client_h() -> i32 {
-    let needed = CANDIDATE_ROW_H
-        + 2
-        + AUX_ROW_H
-        + SIMPLEX_GAP
-        + AUX_ROW_H
-        + SIMPLEX_GAP
-        + LETTER_ROW_MIN_H * 3
-        + SIMPLEX_GAP * 2
-        + SIMPLEX_GAP
-        + ENGLISH_ROW_MIN_H * 3
-        + SIMPLEX_GAP * 2
-        + SIMPLEX_GAP
-        + ACTION_ROW_H
-        + 2
-        + 28;
-    needed.max(prefs::MIN_CLIENT_H)
+    let gap = dp(SIMPLEX_GAP);
+    let needed = dp(CANDIDATE_ROW_H + 2)
+        + dp(AUX_ROW_H)
+        + gap
+        + dp(AUX_ROW_H)
+        + gap
+        + dp(LETTER_ROW_MIN_H) * 3
+        + gap * 2
+        + gap
+        + dp(ENGLISH_ROW_MIN_H) * 3
+        + gap * 2
+        + gap
+        + dp(ACTION_ROW_H)
+        + dp(2)
+        + dp(HINT_ROW_MIN_H)
+        + dp(28);
+    needed.max(dp(prefs::MIN_CLIENT_H))
 }
 
 struct SimplexLayout {
@@ -633,13 +761,13 @@ struct SimplexLayout {
 }
 
 fn action_rects(row: RECT) -> Vec<(Hit, &'static str, RECT)> {
-    let usable = (row.right - row.left).max(40);
+    let usable = (row.right - row.left).max(dp(40));
     // Clearly shorter than letter keys (row height is ACTION_ROW_H) and not
     // stretched as wide as the old full-pitch buttons.
-    let action_w = ((usable - 3 * KEY_GAP) / 4).clamp(40, 72);
+    let action_w = ((usable - 3 * dp(KEY_GAP)) / 4).clamp(dp(40), dp(72));
     let recs = centered_keys(row, 4, action_w);
     vec![
-        (Hit::Delete, "刪", recs[0]),
+        (Hit::Delete, "刪碼", recs[0]),
         (Hit::Clear, "清除", recs[1]),
         (Hit::Space, "空格", recs[2]),
         (Hit::SymbolToggle, "符號", recs[3]),
@@ -647,26 +775,31 @@ fn action_rects(row: RECT) -> Vec<(Hit, &'static str, RECT)> {
 }
 
 fn simplex_layout(client: RECT, symbols_open: bool) -> SimplexLayout {
-    let left = GRID_PAD;
-    let right = (client.right - GRID_PAD).max(left + 40);
+    // Scale every design constant once; the rest of the layout is in
+    // physical pixels.
+    let key_gap = dp(KEY_GAP);
+    let row_gap = dp(SIMPLEX_GAP);
+    let aux_row_h = dp(AUX_ROW_H);
+    let left = dp(GRID_PAD);
+    let right = (client.right - dp(GRID_PAD)).max(left + dp(40));
     let usable = right - left;
 
-    let y = CANDIDATE_ROW_H + 2;
+    let y = dp(CANDIDATE_ROW_H + 2);
     let num_row = RECT {
         left,
         top: y,
         right,
-        bottom: y + AUX_ROW_H,
+        bottom: y + aux_row_h,
     };
     // 1–9 0 plus a slightly wider Bksp at the end, like a keyboard.
-    let unit = ((usable - 10 * KEY_GAP) as f32 / 11.6).max(14.0);
+    let unit = ((usable - 10 * key_gap) as f32 / 11.6).max(dp(14) as f32);
     let digit_w = unit as i32;
-    let bksp_w = ((unit * 1.6) as i32).max(digit_w + 8);
-    let total = digit_w * 10 + bksp_w + 10 * KEY_GAP;
+    let bksp_w = ((unit * 1.6) as i32).max(digit_w + dp(8));
+    let total = digit_w * 10 + bksp_w + 10 * key_gap;
     let x0 = left + (usable - total).max(0) / 2;
     let mut digits = Vec::new();
     for (i, ch) in DIGIT_CHARS.iter().copied().enumerate() {
-        let x = x0 + (i as i32) * (digit_w + KEY_GAP);
+        let x = x0 + (i as i32) * (digit_w + key_gap);
         digits.push((
             ch,
             RECT {
@@ -677,7 +810,7 @@ fn simplex_layout(client: RECT, symbols_open: bool) -> SimplexLayout {
             },
         ));
     }
-    let bx = x0 + 10 * (digit_w + KEY_GAP);
+    let bx = x0 + 10 * (digit_w + key_gap);
     let backspace = RECT {
         left: bx,
         top: num_row.top,
@@ -685,14 +818,14 @@ fn simplex_layout(client: RECT, symbols_open: bool) -> SimplexLayout {
         bottom: num_row.bottom,
     };
 
-    let y2 = num_row.bottom + SIMPLEX_GAP;
+    let y2 = num_row.bottom + row_gap;
     let aux2 = RECT {
         left,
         top: y2,
         right,
-        bottom: y2 + AUX_ROW_H,
+        bottom: y2 + aux_row_h,
     };
-    let aux2_w = ((usable - 7 * KEY_GAP) / 8).max(16);
+    let aux2_w = ((usable - 7 * key_gap) / 8).max(dp(16));
     let aux2_keys = centered_keys(aux2, 8, aux2_w);
     let mut puncts = Vec::new();
     for (ch, rc) in PUNCT_CHARS
@@ -711,9 +844,9 @@ fn simplex_layout(client: RECT, symbols_open: bool) -> SimplexLayout {
         navs.push((nav, rc));
     }
 
-    let status = AppState::status_h(client.bottom - client.top);
-    let action_bottom = client.bottom - status - 2;
-    let action_top = action_bottom - ACTION_ROW_H;
+    let status = AppState::footer_h(client.bottom - client.top);
+    let action_bottom = client.bottom - status - dp(2);
+    let action_top = action_bottom - dp(ACTION_ROW_H);
     let action_row = RECT {
         left,
         top: action_top,
@@ -722,8 +855,8 @@ fn simplex_layout(client: RECT, symbols_open: bool) -> SimplexLayout {
     };
     let actions = action_rects(action_row);
 
-    let content_top = aux2.bottom + SIMPLEX_GAP;
-    let content_bottom = action_top - SIMPLEX_GAP;
+    let content_top = aux2.bottom + row_gap;
+    let content_bottom = action_top - row_gap;
     let avail = (content_bottom - content_top).max(1);
 
     let mut letters = Vec::new();
@@ -731,15 +864,15 @@ fn simplex_layout(client: RECT, symbols_open: bool) -> SimplexLayout {
     let letter_h;
 
     if symbols_open {
-        let rh = ((avail - 3 * SIMPLEX_GAP) / 4).clamp(22, 48);
+        let rh = ((avail - 3 * row_gap) / 4).clamp(dp(22), dp(48));
         letter_h = rh;
-        let key_w = ((usable - 12 * KEY_GAP) / 13).max(14);
+        let key_w = ((usable - 12 * key_gap) / 13).max(dp(14));
         for (i, row) in simplex::SYMBOL_ROWS.iter().enumerate() {
             let row_rc = RECT {
                 left,
-                top: content_top + (i as i32) * (rh + SIMPLEX_GAP),
+                top: content_top + (i as i32) * (rh + row_gap),
                 right,
-                bottom: content_top + (i as i32) * (rh + SIMPLEX_GAP) + rh,
+                bottom: content_top + (i as i32) * (rh + row_gap) + rh,
             };
             let recs = centered_keys(row_rc, row.len() as i32, key_w);
             for (sk, rc) in row.iter().zip(recs) {
@@ -747,15 +880,15 @@ fn simplex_layout(client: RECT, symbols_open: bool) -> SimplexLayout {
             }
         }
     } else {
-        letter_h = ((avail - 2 * SIMPLEX_GAP) / 3).clamp(LETTER_ROW_MIN_H, LETTER_ROW_MAX_H);
-        let key_w = ((usable - 9 * KEY_GAP) / 10).max(16);
+        letter_h = ((avail - 2 * row_gap) / 3).clamp(dp(LETTER_ROW_MIN_H), dp(LETTER_ROW_MAX_H));
+        let key_w = ((usable - 9 * key_gap) / 10).max(dp(16));
         let rows_chars: [&[char]; 3] = [simplex::ROW_QWERTY, simplex::ROW_ASDF, simplex::ROW_ZXCV];
         for (i, row_chars) in rows_chars.iter().enumerate() {
             let row_rc = RECT {
                 left,
-                top: content_top + (i as i32) * (letter_h + SIMPLEX_GAP),
+                top: content_top + (i as i32) * (letter_h + row_gap),
                 right,
-                bottom: content_top + (i as i32) * (letter_h + SIMPLEX_GAP) + letter_h,
+                bottom: content_top + (i as i32) * (letter_h + row_gap) + letter_h,
             };
             let recs = centered_keys(row_rc, row_chars.len() as i32, key_w);
             for (ch, rc) in row_chars.iter().copied().zip(recs) {
@@ -779,17 +912,18 @@ fn simplex_layout(client: RECT, symbols_open: bool) -> SimplexLayout {
             .max()
             .unwrap_or(content_top)
     };
-    let eng_top = last_kb_bottom + SIMPLEX_GAP;
-    let eng_bottom = action_top - SIMPLEX_GAP;
+    let eng_top = last_kb_bottom + row_gap;
+    let eng_bottom = action_top - row_gap;
     let eng_avail = (eng_bottom - eng_top).max(1);
-    let english_h = ((eng_avail - 2 * SIMPLEX_GAP) / 3).clamp(ENGLISH_ROW_MIN_H, ENGLISH_ROW_MAX_H);
-    let en_key_w = ((usable - 9 * KEY_GAP) / 10).max(14);
-    let unit = en_key_w + KEY_GAP;
-    let block_w = en_key_w * 10 + KEY_GAP * 9;
+    let english_h =
+        ((eng_avail - 2 * row_gap) / 3).clamp(dp(ENGLISH_ROW_MIN_H), dp(ENGLISH_ROW_MAX_H));
+    let en_key_w = ((usable - 9 * key_gap) / 10).max(dp(14));
+    let unit = en_key_w + key_gap;
+    let block_w = en_key_w * 10 + key_gap * 9;
     let x_base = left + (usable - block_w).max(0) / 2;
     let mut english = Vec::new();
     for (i, row_chars) in ENGLISH_ROWS.iter().enumerate() {
-        let row_top = eng_top + (i as i32) * (english_h + SIMPLEX_GAP);
+        let row_top = eng_top + (i as i32) * (english_h + row_gap);
         let indent = match i {
             1 => unit / 2,
             2 => unit,
@@ -831,6 +965,7 @@ impl AppState {
         let key = (
             client.right - client.left,
             client.bottom - client.top,
+            current_dpi(),
             self.symbols_open,
         );
         let mut cache = self.simplex_cache.borrow_mut();
@@ -994,12 +1129,13 @@ impl AppState {
             let layout = self.layout(client);
             (layout.letter_h.max(1), layout.english_h.max(1))
         };
-        let cand_h = CANDIDATE_ROW_H;
+        let cand_h = dp(CANDIDATE_ROW_H);
         let mode_tag = match (self.mode, self.symbols_open) {
             (Mode::Cp437, _) => 0,
             (Mode::Simplex, false) => 1,
             (Mode::Simplex, true) => 2,
         };
+        // cand_h is DPI-scaled, so a DPI change alone also rebuilds fonts.
         let key = (key_h, cand_h, english_h, mode_tag);
         if key == self.font_key && handle_nonzero(self.fonts.glyph) {
             return;
@@ -1009,7 +1145,7 @@ impl AppState {
         let glyph_h = (key_h as f32 * 0.46).round() as i32;
         let caption_h = (key_h as f32 * 0.20).round() as i32;
         let named_h = if self.mode == Mode::Simplex {
-            (ACTION_ROW_H as f32 * 0.50).round() as i32
+            (dp(ACTION_ROW_H) as f32 * 0.50).round() as i32
         } else {
             (key_h as f32 * 0.26).round() as i32
         };
@@ -1019,52 +1155,54 @@ impl AppState {
         // reserved band for the letter so the two never collide.
         let radical_h = (key_h as f32 * 0.34).round() as i32;
         let letter_h = (key_h as f32 * 0.18).round() as i32;
-        let cand_font_h = ((cand_h - 8) as f32 * 0.58).round() as i32;
+        let cand_font_h = ((cand_h - dp(8)) as f32 * 0.58).round() as i32;
+        // Font size clamps are design pixels too.
+        let clamp = |v: i32, lo: i32, hi: i32| v.clamp(dp(lo), dp(hi));
         self.fonts.glyph = create_font(
             "Segoe UI Symbol",
-            glyph_h.clamp(11, 72),
+            clamp(glyph_h, 11, 72),
             FW_SEMIBOLD.0 as i32,
         );
-        self.fonts.caption = create_font("Segoe UI", caption_h.clamp(9, 22), FW_NORMAL.0 as i32);
+        self.fonts.caption = create_font("Segoe UI", clamp(caption_h, 9, 22), FW_NORMAL.0 as i32);
         self.fonts.named = create_font(
             "Microsoft JhengHei",
             if self.mode == Mode::Simplex {
-                named_h.clamp(10, 14)
+                clamp(named_h, 10, 14)
             } else {
-                named_h.clamp(10, 28)
+                clamp(named_h, 10, 28)
             },
             FW_SEMIBOLD.0 as i32,
         );
         self.fonts.status = create_font(
             "Microsoft JhengHei",
-            status_font_h.clamp(12, 20),
+            clamp(status_font_h, 12, 20),
             FW_NORMAL.0 as i32,
         );
         self.fonts.radical = create_font(
             "Microsoft JhengHei",
-            radical_h.clamp(11, 22),
+            clamp(radical_h, 11, 22),
             FW_SEMIBOLD.0 as i32,
         );
-        self.fonts.letter = create_font("Segoe UI", letter_h.clamp(8, 12), FW_NORMAL.0 as i32);
+        self.fonts.letter = create_font("Segoe UI", clamp(letter_h, 8, 12), FW_NORMAL.0 as i32);
         let english_font_h = (english_h as f32 * 0.46).round() as i32;
         self.fonts.english = create_font(
             "Segoe UI",
-            english_font_h.clamp(10, 20),
+            clamp(english_font_h, 10, 20),
             FW_SEMIBOLD.0 as i32,
         );
         self.fonts.cand_jhenghei = create_font(
             "Microsoft JhengHei",
-            cand_font_h.clamp(13, 32),
+            clamp(cand_font_h, 13, 32),
             FW_SEMIBOLD.0 as i32,
         );
         self.fonts.cand_hkscs = create_font(
             "MingLiU_HKSCS",
-            cand_font_h.clamp(13, 32),
+            clamp(cand_font_h, 13, 32),
             FW_SEMIBOLD.0 as i32,
         );
         self.fonts.cand_extb = create_font(
             "MingLiU_HKSCS-ExtB",
-            cand_font_h.clamp(13, 32),
+            clamp(cand_font_h, 13, 32),
             FW_SEMIBOLD.0 as i32,
         );
     }
@@ -1088,6 +1226,8 @@ impl Drop for AppState {
                 HGDIOBJ(self.brushes.selected.0),
                 HGDIOBJ(self.brushes.disabled.0),
                 HGDIOBJ(self.brushes.border.0),
+                HGDIOBJ(self.brushes.control_pen.0),
+                HGDIOBJ(self.brushes.compose_pen.0),
             ];
             for obj in objs {
                 if handle_nonzero(obj) {
@@ -1101,7 +1241,7 @@ impl Drop for AppState {
 unsafe fn create_font(name: &str, height: i32, weight: i32) -> HFONT {
     let face = wide(name);
     CreateFontW(
-        -height.max(8),
+        -height.max(dp(8)),
         0,
         0,
         0,
@@ -1150,9 +1290,11 @@ fn save_prefs(hwnd: HWND) {
     if unsafe { IsIconic(hwnd).as_bool() } {
         return;
     }
+    // Sizes are stored in 96-DPI design pixels so the window keeps the same
+    // apparent size when the scale factor or monitor changes.
     let rc = client_rect(hwnd);
-    let w = rc.right - rc.left;
-    let h = rc.bottom - rc.top;
+    let w = undp(rc.right - rc.left).max(prefs::MIN_CLIENT_W);
+    let h = undp(rc.bottom - rc.top).max(prefs::MIN_CLIENT_H);
     let mut wr = RECT::default();
     unsafe {
         let _ = GetWindowRect(hwnd, &mut wr);
@@ -1187,9 +1329,9 @@ fn clamp_window_pos(x: i32, y: i32, win_w: i32, win_h: i32) -> (i32, i32) {
         if vw <= 0 || vh <= 0 {
             return (x, y);
         }
-        let min_visible = 80;
+        let min_visible = dp(80);
         let nx = x.clamp(vx - win_w + min_visible, vx + vw - min_visible);
-        let ny = y.clamp(vy, vy + vh - 40);
+        let ny = y.clamp(vy, vy + vh - dp(40));
         let _ = win_h;
         (nx, ny)
     }
@@ -1222,9 +1364,9 @@ fn apply_topmost(hwnd: HWND, topmost: bool) {
 
 fn topmost_hint(state: &AppState) -> String {
     if state.topmost {
-        "置頂  ·  開  ·  點擊取消置頂（唔會輸入）".to_string()
+        "置頂：開  ·  點擊取消置頂".to_string()
     } else {
-        "置頂  ·  關  ·  點擊重新置頂（唔會輸入）".to_string()
+        "置頂：關  ·  點擊重新置頂".to_string()
     }
 }
 
@@ -1267,23 +1409,15 @@ fn apply_mode_min_size(hwnd: HWND, state: &AppState) {
     if w >= min_w && h >= min_h {
         return;
     }
-    let new_w = w.max(min_w);
-    let new_h = h.max(min_h);
-    let mut wr = RECT {
-        left: 0,
-        top: 0,
-        right: new_w,
-        bottom: new_h,
-    };
+    let (win_w, win_h) = window_size_for_client(w.max(min_w), h.max(min_h), current_dpi());
     unsafe {
-        let _ = AdjustWindowRectEx(&mut wr, APP_STYLE, false, APP_EX_STYLE_BASE);
         let _ = SetWindowPos(
             hwnd,
             HWND::default(),
             0,
             0,
-            wr.right - wr.left,
-            wr.bottom - wr.top,
+            win_w,
+            win_h,
             SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOZORDER,
         );
     }
@@ -1473,32 +1607,14 @@ pub fn run() -> WinResult<()> {
         }
 
         let saved = load_prefs();
-        // First launch (no saved size): the screenshot-measured 480×460 client,
-        // never the old 900×820 default. Missing or invalid mode defaults to
-        // CP437; otherwise the last mode is restored.
-        let client_w = saved
-            .as_ref()
-            .map(|p| p.width)
-            .unwrap_or(prefs::DEFAULT_CLIENT_W)
-            .max(prefs::MIN_CLIENT_W);
-        let client_h = saved
-            .as_ref()
-            .map(|p| p.height)
-            .unwrap_or(prefs::DEFAULT_CLIENT_H)
-            .max(prefs::MIN_CLIENT_H);
-
-        let mut wr = RECT {
-            left: 0,
-            top: 0,
-            right: client_w,
-            bottom: client_h,
-        };
         let topmost = saved.as_ref().map(|p| p.topmost).unwrap_or(true);
-        AdjustWindowRectEx(&mut wr, APP_STYLE, false, APP_EX_STYLE_BASE)?;
-        let win_w = wr.right - wr.left;
-        let win_h = wr.bottom - wr.top;
-
-        let (win_x, win_y) = match saved.as_ref().and_then(|p| Some((p.x?, p.y?))) {
+        // Create at the 96-DPI size first; the real DPI is only known once
+        // the window exists on a monitor, and it is resized below before it
+        // is shown.
+        let (win_w, win_h) =
+            window_size_for_client(prefs::DEFAULT_CLIENT_W, prefs::DEFAULT_CLIENT_H, BASE_DPI);
+        let saved_pos = saved.as_ref().and_then(|p| Some((p.x?, p.y?)));
+        let (win_x, win_y) = match saved_pos {
             Some((x, y)) => clamp_window_pos(x, y, win_w, win_h),
             None => (CW_USEDEFAULT, CW_USEDEFAULT),
         };
@@ -1522,6 +1638,27 @@ pub fn run() -> WinResult<()> {
             HINSTANCE::from(instance),
             None,
         )?;
+
+        set_current_dpi(GetDpiForWindow(hwnd));
+        // First launch (no saved size): the screenshot-measured 480×460
+        // client, never the old 900×820 default, scaled to the monitor's DPI.
+        // Missing or invalid mode defaults to CP437; otherwise the last mode
+        // is restored. Legacy prefs stored physical pixels; convert them.
+        let (saved_w, saved_h) = match saved.as_ref() {
+            Some(p) if p.dip => (p.width, p.height),
+            Some(p) => (undp(p.width), undp(p.height)),
+            None => (prefs::DEFAULT_CLIENT_W, prefs::DEFAULT_CLIENT_H),
+        };
+        let client_w = dp(saved_w.max(prefs::MIN_CLIENT_W));
+        let client_h = dp(saved_h.max(prefs::MIN_CLIENT_H));
+        let (win_w, win_h) = window_size_for_client(client_w, client_h, current_dpi());
+        let mut flags = SWP_NOZORDER | SWP_NOACTIVATE;
+        let (mut x, mut y) = (0, 0);
+        match saved_pos {
+            Some((sx, sy)) => (x, y) = clamp_window_pos(sx, sy, win_w, win_h),
+            None => flags |= SWP_NOMOVE,
+        }
+        let _ = SetWindowPos(hwnd, HWND::default(), x, y, win_w, win_h, flags);
 
         let mut state = AppState::new()?;
         state.mode = start_mode;
@@ -1563,22 +1700,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if !info.is_null() {
                 let (min_w, min_h) = state_mut(hwnd)
                     .map(|s| s.min_client())
-                    .unwrap_or((prefs::MIN_CLIENT_W, prefs::MIN_CLIENT_H));
-                let mut wr = RECT {
-                    left: 0,
-                    top: 0,
-                    right: min_w,
-                    bottom: min_h,
-                };
-                let _ = AdjustWindowRectEx(&mut wr, APP_STYLE, false, APP_EX_STYLE_BASE);
-                (*info).ptMinTrackSize = POINT {
-                    x: wr.right - wr.left,
-                    y: wr.bottom - wr.top,
-                };
+                    .unwrap_or((dp(prefs::MIN_CLIENT_W), dp(prefs::MIN_CLIENT_H)));
+                let (x, y) = window_size_for_client(min_w, min_h, current_dpi());
+                (*info).ptMinTrackSize = POINT { x, y };
             }
             LRESULT(0)
         }
         WM_DPICHANGED => {
+            // Update the scale before moving: MoveWindow re-enters
+            // WM_GETMINMAXINFO / WM_SIZE, which must see the new DPI.
+            set_current_dpi((wparam.0 & 0xFFFF) as u32);
             let suggested = lparam.0 as *const RECT;
             if !suggested.is_null() {
                 let r = *suggested;
@@ -1593,8 +1724,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             if let Some(state) = state_mut(hwnd) {
                 state.font_key = (0, 0, 0, 255);
+                state.invalidate_layout();
             }
             let _ = InvalidateRect(hwnd, None, false);
+            a11y::notify_reorder(hwnd);
             LRESULT(0)
         }
         WM_MOVE => {
@@ -1923,8 +2056,8 @@ unsafe fn paint(hwnd: HWND) {
     let _ = IntersectClipRect(mem, dirty.left, dirty.top, dirty.right, dirty.bottom);
     FillRect(mem, &dirty, state.brushes.bg);
 
-    let status_rc = AppState::status_rect(rc);
-    FillRect(mem, &status_rc, state.brushes.status);
+    let footer_rc = AppState::footer_rect(rc);
+    FillRect(mem, &footer_rc, state.brushes.status);
 
     let old_pen = SelectObject(mem, HGDIOBJ(state.brushes.border.0));
     // The back buffer outlives this paint, so put its original font back at
@@ -1979,7 +2112,7 @@ unsafe fn draw_mode_switch(hdc: HDC, state: &AppState, client: RECT) {
             state.brushes.key
         };
         let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
-        let _ = RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, 6, 6);
+        let _ = RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, dp(6), dp(6));
         SelectObject(hdc, old_brush);
         let _ = SelectObject(hdc, HGDIOBJ(state.fonts.status.0));
         SetTextColor(
@@ -2016,11 +2149,9 @@ unsafe fn draw_opacity_btn(hdc: HDC, state: &AppState, client: RECT) {
     } else {
         state.brushes.special
     };
-    let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
-    let _ = RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, 6, 6);
-    SelectObject(hdc, old_brush);
+    draw_key_body(hdc, state, rc, dp(6), brush, Accent::Control);
     let _ = SelectObject(hdc, HGDIOBJ(state.fonts.status.0));
-    SetTextColor(hdc, rgb(0xF4, 0xF5, 0xF8));
+    SetTextColor(hdc, CONTROL_TEXT);
     let mut text: Vec<u16> = state.opacity.label().encode_utf16().collect();
     let mut text_rc = RECT {
         left: rc.left + 1,
@@ -2050,7 +2181,7 @@ unsafe fn draw_ascii_space_bar(hdc: HDC, state: &AppState, client: RECT) {
         state.brushes.key
     };
     let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
-    let _ = RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, 6, 6);
+    let _ = RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, dp(6), dp(6));
     SelectObject(hdc, old_brush);
     let _ = SelectObject(hdc, HGDIOBJ(state.fonts.status.0));
     SetTextColor(hdc, rgb(0xF4, 0xF5, 0xF8));
@@ -2086,12 +2217,12 @@ unsafe fn draw_hint(hdc: HDC, state: &AppState, client: RECT) {
 fn hint_text(state: &AppState) -> String {
     if matches!(state.hover, Some(Hit::Opacity)) {
         return format!(
-            "透明度  ·  {}  ·  點擊切換 100% / 50% / 25%（100% 為完全不透明）",
+            "透明度 {}  ·  點擊切換 100% / 50% / 25%",
             state.opacity.label()
         );
     }
     if matches!(state.hover, Some(Hit::AsciiSpace)) {
-        return "空白  ·  Space  ·  輸入空格（U+0020）到先前聚焦視窗".to_string();
+        return "Space  ·  輸入空格到先前視窗".to_string();
     }
     if matches!(state.hover, Some(Hit::Brand) | Some(Hit::Cp437(0))) {
         return topmost_hint(state);
@@ -2106,7 +2237,7 @@ fn hint_text(state: &AppState) -> String {
                     return topmost_hint(state);
                 }
                 if code == 32 {
-                    let text = "BS  ·  Backspace  ·  刪除先前聚焦視窗嘅一個字元";
+                    let text = "BS  ·  Backspace  ·  刪除先前視窗一個字元";
                     if state.last_typed_cp437 == Some(32)
                         && !matches!(state.hover, Some(Hit::Cp437(_)))
                     {
@@ -2127,7 +2258,7 @@ fn hint_text(state: &AppState) -> String {
                     text
                 }
             } else {
-                "置頂 · 唔會搶焦點 · 點擊按鍵輸入到先前聚焦嘅視窗 · 拖曳邊緣可調整大小".to_string()
+                "點擊按鍵輸入到先前視窗  ·  唔會搶焦點  ·  拖曳邊緣調整大小".to_string()
             }
         }
         Mode::Simplex => match state.hover {
@@ -2141,35 +2272,35 @@ fn hint_text(state: &AppState) -> String {
             Some(Hit::Latin(ch)) => {
                 let shifted = latin_shifted_char(ch);
                 if ch == ',' || ch == '.' {
-                    format!(
-                        "英文  ·  {ch}  ·  短按 {ch}、按住 {LATIN_HOLD_MS}ms 出 {shifted}（唔係速成碼）"
-                    )
+                    format!("英文 {ch}  ·  短按 {ch}，按住出 {shifted}")
                 } else {
-                    format!("英文  ·  {ch}  ·  短按小寫、按住 {LATIN_HOLD_MS}ms 大寫（唔係速成碼）")
+                    format!("英文 {ch}  ·  短按小寫，按住大寫")
                 }
             }
             Some(Hit::Digit(ch)) | Some(Hit::Punct(ch)) => {
-                format!("點擊輸入  ·  {ch}  到先前聚焦視窗")
+                format!("{ch}  ·  點擊輸入到先前視窗")
             }
             Some(Hit::Nav(nav)) => {
-                format!("{}  ·  送到先前聚焦視窗", nav.label())
+                format!("{}  ·  送到先前視窗", nav.label())
             }
             Some(Hit::Backspace) => {
                 if has_simplex_composition(state) {
-                    "Bksp  ·  取消今次速成取碼（唔會送到目標視窗）".to_string()
+                    "Bksp  ·  取消今次速成取碼".to_string()
                 } else {
-                    "Bksp  ·  Backspace  ·  刪除先前聚焦視窗嘅一個字元（唔改速成編碼）".to_string()
+                    "Bksp  ·  刪除先前視窗一個字元".to_string()
                 }
             }
-            Some(Hit::Delete) => "刪  ·  刪除一個速成碼".to_string(),
+            Some(Hit::Delete) => "刪碼  ·  刪除最後一個速成碼（唔會送到目標視窗）".to_string(),
+            Some(Hit::Clear) => "清除  ·  清除全部速成碼（唔會送到目標視窗）".to_string(),
+            Some(Hit::Space) => "空格  ·  上第一個候選字（要輸入空白請用底部 Space）".to_string(),
+            Some(Hit::SymbolToggle) => "符號  ·  切換符號鍵盤／速成字根".to_string(),
             _ if state.symbols_open => {
-                "符號 · 對齊微軟倉頡／速成 Ctrl+Alt+, 符號鍵盤 · 點符號輸入到先前聚焦視窗"
-                    .to_string()
+                "符號  ·  同 Ctrl+Alt+, 符號鍵盤一樣  ·  點擊輸入".to_string()
             }
             _ if state.last_typed.is_some() => {
                 format!("已輸入  ·  {}", state.last_typed.unwrap())
             }
-            _ => "速成 · 最多兩碼（首尾）· 點候選或空格上字到先前聚焦視窗".to_string(),
+            _ => "速成  ·  最多兩碼（首尾）  ·  點候選或 Space 上字".to_string(),
         },
     }
 }
@@ -2218,7 +2349,15 @@ unsafe fn draw_simplex(hdc: HDC, state: &AppState, client: RECT, dirty: RECT) {
             state.brushes.key
         };
         let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
-        let _ = RoundRect(hdc, slot.left, slot.top, slot.right, slot.bottom, 6, 6);
+        let _ = RoundRect(
+            hdc,
+            slot.left,
+            slot.top,
+            slot.right,
+            slot.bottom,
+            dp(6),
+            dp(6),
+        );
         SelectObject(hdc, old_brush);
         if let Some(ch) = ch {
             let font = pick_cand_font(hdc, &state.fonts, ch);
@@ -2238,7 +2377,7 @@ unsafe fn draw_simplex(hdc: HDC, state: &AppState, client: RECT, dirty: RECT) {
     let can_prev = !state.symbols_open && simplex::can_page_prev(state.page);
     let can_next =
         !state.symbols_open && simplex::can_page_next(state.current_candidates().len(), state.page);
-    let narrow = client.right - client.left < 430;
+    let narrow = client.right - client.left < dp(430);
     let prev_label = if narrow { "◀" } else { "上" };
     let next_label = if narrow { "▶" } else { "下" };
     draw_page_btn(hdc, state, prev, Hit::PagePrev, prev_label, can_prev);
@@ -2297,12 +2436,22 @@ unsafe fn draw_labeled_key(
     } else {
         state.brushes.key
     };
-    let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
-    let radius = ((rc.bottom - rc.top).min(rc.right - rc.left) / 6).clamp(2, 8);
-    let _ = RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
-    SelectObject(hdc, old_brush);
+    let radius = ((rc.bottom - rc.top).min(rc.right - rc.left) / 6).clamp(dp(2), dp(8));
+    let accent = if special {
+        Accent::Control
+    } else {
+        Accent::None
+    };
+    draw_key_body(hdc, state, rc, radius, brush, accent);
     let _ = SelectObject(hdc, HGDIOBJ(state.fonts.status.0));
-    SetTextColor(hdc, rgb(0xF4, 0xF5, 0xF8));
+    SetTextColor(
+        hdc,
+        if special {
+            CONTROL_TEXT
+        } else {
+            rgb(0xF4, 0xF5, 0xF8)
+        },
+    );
     let mut text: Vec<u16> = label.encode_utf16().collect();
     let mut tr = RECT {
         left: rc.left + 1,
@@ -2336,7 +2485,7 @@ unsafe fn draw_page_btn(
         state.brushes.key
     };
     let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
-    let _ = RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, 6, 6);
+    let _ = RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, dp(6), dp(6));
     SelectObject(hdc, old_brush);
     let _ = SelectObject(hdc, HGDIOBJ(state.fonts.status.0));
     SetTextColor(
@@ -2371,10 +2520,8 @@ unsafe fn draw_brand_chip(hdc: HDC, state: &AppState, rc: RECT) {
     } else {
         state.brushes.disabled
     };
-    let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
-    let radius = ((rc.bottom - rc.top).min(rc.right - rc.left) / 6).clamp(2, 8);
-    let _ = RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
-    SelectObject(hdc, old_brush);
+    let radius = ((rc.bottom - rc.top).min(rc.right - rc.left) / 6).clamp(dp(2), dp(8));
+    draw_key_body(hdc, state, rc, radius, brush, Accent::Control);
     let _ = SelectObject(hdc, HGDIOBJ(state.fonts.named.0));
     SetTextColor(
         hdc,
@@ -2412,7 +2559,7 @@ unsafe fn draw_english_key(hdc: HDC, state: &AppState, rc: RECT, letter: char) {
         state.brushes.english
     };
     let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
-    let radius = ((rc.bottom - rc.top).min(rc.right - rc.left) / 6).clamp(2, 8);
+    let radius = ((rc.bottom - rc.top).min(rc.right - rc.left) / 6).clamp(dp(2), dp(8));
     let _ = RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
     SelectObject(hdc, old_brush);
     let shifted = state.latin_shifted && state.pressed == Some(Hit::Latin(letter));
@@ -2443,6 +2590,22 @@ unsafe fn draw_english_key(hdc: HDC, state: &AppState, rc: RECT, letter: char) {
         &mut tr,
         DT_CENTER | DT_VCENTER | DT_SINGLELINE,
     );
+    // Keycap-style corner mark: shows what a long press types, so
+    // hold-for-capitals is discoverable without reading the status bar.
+    let w = rc.right - rc.left;
+    let h = rc.bottom - rc.top;
+    if !shifted && w >= dp(24) && h >= dp(20) {
+        let _ = SelectObject(hdc, HGDIOBJ(state.fonts.letter.0));
+        SetTextColor(hdc, HOLD_MARK_TEXT);
+        let mut mark = utf16_char(latin_shifted_char(letter));
+        let mut mr = RECT {
+            left: rc.left + w / 2,
+            top: rc.top + 1,
+            right: rc.right - 3,
+            bottom: rc.top + h / 2,
+        };
+        DrawTextW(hdc, &mut mark, &mut mr, DT_RIGHT | DT_TOP | DT_SINGLELINE);
+    }
 }
 
 unsafe fn draw_letter_key(hdc: HDC, state: &AppState, rc: RECT, letter: char) {
@@ -2458,7 +2621,7 @@ unsafe fn draw_letter_key(hdc: HDC, state: &AppState, rc: RECT, letter: char) {
         state.brushes.key
     };
     let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
-    let radius = ((rc.bottom - rc.top).min(rc.right - rc.left) / 6).clamp(2, 10);
+    let radius = ((rc.bottom - rc.top).min(rc.right - rc.left) / 6).clamp(dp(2), dp(10));
     let _ = RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
     SelectObject(hdc, old_brush);
 
@@ -2468,8 +2631,8 @@ unsafe fn draw_letter_key(hdc: HDC, state: &AppState, rc: RECT, letter: char) {
     let w = rc.right - rc.left;
     // Reserved letter band + inner padding so the radical never clips the
     // key edge or collides with the Latin letter.
-    let pad = 3.max((h.min(w) / 16).min(5));
-    let letter_band = (h * 30 / 100).clamp(11, 16);
+    let pad = dp(3).max((h.min(w) / 16).min(dp(5)));
+    let letter_band = (h * 30 / 100).clamp(dp(11), dp(16));
     let mut rad_wide: Vec<u16> = utf16_char(rad);
     let _ = SelectObject(hdc, HGDIOBJ(state.fonts.radical.0));
     SetTextColor(hdc, rgb(0xF4, 0xF5, 0xF8));
@@ -2477,7 +2640,7 @@ unsafe fn draw_letter_key(hdc: HDC, state: &AppState, rc: RECT, letter: char) {
         left: rc.left + pad,
         top: rc.top + pad,
         right: rc.right - pad,
-        bottom: (rc.bottom - letter_band).max(rc.top + pad + 8),
+        bottom: (rc.bottom - letter_band).max(rc.top + pad + dp(8)),
     };
     DrawTextW(
         hdc,
@@ -2514,12 +2677,12 @@ unsafe fn draw_symbol_key(hdc: HDC, state: &AppState, rc: RECT, ch: char, keycap
         state.brushes.key
     };
     let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
-    let radius = ((rc.bottom - rc.top).min(rc.right - rc.left) / 6).clamp(2, 8);
+    let radius = ((rc.bottom - rc.top).min(rc.right - rc.left) / 6).clamp(dp(2), dp(8));
     let _ = RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
     SelectObject(hdc, old_brush);
 
     let h = rc.bottom - rc.top;
-    let show_cap = h >= 26;
+    let show_cap = h >= dp(26);
     let font = pick_cand_font(hdc, &state.fonts, ch);
     let _ = SelectObject(hdc, HGDIOBJ(font.0));
     SetTextColor(hdc, rgb(0xF4, 0xF5, 0xF8));
@@ -2529,7 +2692,7 @@ unsafe fn draw_symbol_key(hdc: HDC, state: &AppState, rc: RECT, ch: char, keycap
         top: rc.top + 1,
         right: rc.right - 1,
         bottom: if show_cap {
-            rc.bottom - (h / 3).max(10)
+            rc.bottom - (h / 3).max(dp(10))
         } else {
             rc.bottom - 1
         },
@@ -2571,12 +2734,10 @@ unsafe fn draw_action_key(hdc: HDC, state: &AppState, rc: RECT, label: &str, hit
     } else {
         state.brushes.special
     };
-    let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
-    let radius = ((rc.bottom - rc.top).min(rc.right - rc.left) / 6).clamp(2, 10);
-    let _ = RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
-    SelectObject(hdc, old_brush);
+    let radius = ((rc.bottom - rc.top).min(rc.right - rc.left) / 6).clamp(dp(2), dp(10));
+    draw_key_body(hdc, state, rc, radius, brush, Accent::Compose);
     let _ = SelectObject(hdc, HGDIOBJ(state.fonts.named.0));
-    SetTextColor(hdc, rgb(0xE8, 0xE4, 0xC8));
+    SetTextColor(hdc, COMPOSE_TEXT);
     let mut text: Vec<u16> = label.encode_utf16().collect();
     let mut tr = RECT {
         left: rc.left + 2,
@@ -2615,13 +2776,21 @@ unsafe fn draw_cp437_key(hdc: HDC, state: &AppState, client: RECT, code: u8) {
         state.brushes.key
     };
 
-    let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
-    let radius = ((rc.bottom - rc.top).min(rc.right - rc.left) / 6).clamp(2, 10);
-    let _ = RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
-    SelectObject(hdc, old_brush);
+    let radius = ((rc.bottom - rc.top).min(rc.right - rc.left) / 6).clamp(dp(2), dp(10));
+    // Cells 0 (topmost toggle) and 32 (Backspace) are controls, not glyphs.
+    let accent = if code == 0 || code == 32 {
+        Accent::Control
+    } else {
+        Accent::None
+    };
+    draw_key_body(hdc, state, rc, radius, brush, accent);
 
     let h = rc.bottom - rc.top;
-    let show_caption = h >= 30 && code != 0 && code != 32;
+    // Full "Alt+n" caption on big keys; at the default window size keys are
+    // only ~22 px tall, so fall back to the bare number in a thin band.
+    let has_caption = code != 0 && code != 32;
+    let full_caption = has_caption && h >= dp(CP437_FULL_CAPTION_H);
+    let show_caption = has_caption && h >= dp(CP437_COMPACT_CAPTION_H);
     let named = code == 0 || code == 32 || cp437::is_named_blank(code);
     let label = if code == 32 {
         "BS".to_string()
@@ -2640,6 +2809,8 @@ unsafe fn draw_cp437_key(hdc: HDC, state: &AppState, client: RECT, code: u8) {
                 } else {
                     rgb(0x7A, 0x80, 0x8C)
                 }
+            } else if code == 32 {
+                CONTROL_TEXT
             } else {
                 rgb(0xE8, 0xE4, 0xC8)
             },
@@ -2654,23 +2825,37 @@ unsafe fn draw_cp437_key(hdc: HDC, state: &AppState, client: RECT, code: u8) {
             left: rc.left + 2,
             top: rc.top + 2,
             right: rc.right - 2,
-            bottom: rc.bottom - (h / 3).max(12),
+            bottom: if full_caption {
+                rc.bottom - (h / 3).max(dp(12))
+            } else {
+                rc.bottom - dp(CP437_COMPACT_CAPTION_BAND)
+            },
         };
-        DrawTextW(
-            hdc,
-            &mut label_wide,
-            &mut glyph_rc,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
-        );
+        // The compact band leaves the glyph a little less room than its font
+        // height, so let it overflow slightly instead of being clipped.
+        let glyph_flags = if full_caption {
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS
+        } else {
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOCLIP
+        };
+        DrawTextW(hdc, &mut label_wide, &mut glyph_rc, glyph_flags);
 
-        let cap = format!("Alt+{code}");
+        let cap = if full_caption {
+            format!("Alt+{code}")
+        } else {
+            code.to_string()
+        };
         let mut cap_wide: Vec<u16> = cap.encode_utf16().collect();
         let _ = SelectObject(hdc, HGDIOBJ(state.fonts.caption.0));
         SetTextColor(hdc, rgb(0x9A, 0xA4, 0xB8));
         let mut cap_rc = RECT {
-            left: rc.left + 2,
-            top: glyph_rc.bottom - 1,
-            right: rc.right - 2,
+            left: rc.left + 1,
+            top: if full_caption {
+                glyph_rc.bottom - 1
+            } else {
+                rc.bottom - dp(CP437_COMPACT_CAPTION_BAND) - 1
+            },
+            right: rc.right - 1,
             bottom: rc.bottom - 1,
         };
         DrawTextW(
