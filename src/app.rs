@@ -10,12 +10,23 @@
 //! bar, auxiliary rows, a readable radical keyboard, a lowercase English
 //! QWERTY band, a compact action row, and the status bar. Last window size
 //! and keyboard mode are remembered.
+//!
+//! 1.3.0 adds a third layout, 九方 (shape input; computer numpad — the
+//! common, unofficial name; not affiliated with 九方科技), a 繁｜簡 output
+//! control (OpenCC hk2s; the Windows IME is never touched), and a 數墊 toggle
+//! for a narrowly scoped `WH_KEYBOARD_LL` hook that turns physical numpad
+//! 0–9 into 九方 keys in every layout. On CP437 / 速成 those keys open a
+//! focus-free overlay panel drawn inside this same window; nothing ever
+//! calls SetFocus / SetForegroundWindow / SetActiveWindow.
 
 #![cfg(windows)]
 
 mod a11y;
+mod hook;
 
-use on99kb::{cp437, prefs, simplex};
+use on99kb::ime::{self, Action};
+use on99kb::prefs::{KeyboardMode as Mode, OutputScript};
+use on99kb::{cp437, prefs, q9, script, simplex};
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -74,8 +85,15 @@ const ROWS: i32 = 16;
 const GRID_PAD: i32 = 8;
 const KEY_GAP: i32 = 3;
 const CANDIDATE_ROW_H: i32 = 48;
-const MODE_SEG_W: i32 = 62;
-const OPACITY_BTN_W: i32 = 50;
+/// Bottom control bar, left to right: `CP437｜速成｜九方`, opacity, `繁｜簡`,
+/// 數墊, then a wide Space. Widths are design pixels; at the default 480 the
+/// Space bar gets 136, above `SPACE_BAR_MIN_W`.
+const BAR_PAD: i32 = 8;
+const BAR_GAP: i32 = 6;
+const MODE_SEG_W: i32 = 52;
+const OPACITY_BTN_W: i32 = 44;
+const OUTPUT_SEG_W: i32 = 30;
+const NUMPAD_BTN_W: i32 = 44;
 const SPACE_BAR_MIN_W: i32 = 96;
 const SPACE_BAR_MAX_W: i32 = 280;
 /// Dedicated full-width row above the control bar for the hint text, so it
@@ -94,6 +112,17 @@ const ACTION_ROW_H: i32 = 26;
 const SIMPLEX_GAP: i32 = 3;
 const ENGLISH_ROW_MIN_H: i32 = 22;
 const ENGLISH_ROW_MAX_H: i32 = 54;
+/// 九方 pad rows (3×3 plus the wide 0) on the 九方 layout.
+const Q9_ROW_MIN_H: i32 = 34;
+const Q9_ROW_MAX_H: i32 = 64;
+const Q9_KEY_MAX_W: i32 = 120;
+/// Overlay (over CP437 / 速成): header, pad rows, action row.
+const OV_HEADER_H: i32 = 24;
+const OV_ROW_H: i32 = 38;
+const OV_ACTION_H: i32 = 26;
+const OV_PAD: i32 = 6;
+/// Private message the keyboard hook posts for a captured numpad digit.
+const WM_APP_NUMPAD: u32 = 0x8000 + 0x39; // WM_APP + 0x39
 
 /// Layout constants above (and the minimum client size in `prefs`) are in
 /// device-independent pixels at 96 DPI (100%). Everything is scaled to the
@@ -233,40 +262,44 @@ fn invalidate_hits(hwnd: HWND, state: &AppState, hits: &[Option<Hit>]) {
     }
 }
 
+/// Title follows the *visible* layout; the numpad overlay never changes it.
 fn title_for(mode: Mode) -> &'static str {
     match mode {
         Mode::Cp437 => "on99KB  —  CP437 螢幕鍵盤",
         Mode::Simplex => "on99KB  —  速成 螢幕鍵盤",
+        Mode::Jiufang => "on99KB  —  九方 螢幕鍵盤",
     }
 }
 
-fn mode_from_prefs(mode: prefs::KeyboardMode) -> Mode {
-    match mode {
-        prefs::KeyboardMode::Cp437 => Mode::Cp437,
-        prefs::KeyboardMode::Simplex => Mode::Simplex,
-    }
-}
+const MODES: [(Mode, &str); 3] = [
+    (Mode::Cp437, "CP437"),
+    (Mode::Simplex, "速成"),
+    (Mode::Jiufang, "九方"),
+];
 
-fn mode_to_prefs(mode: Mode) -> prefs::KeyboardMode {
-    match mode {
-        Mode::Cp437 => prefs::KeyboardMode::Cp437,
-        Mode::Simplex => prefs::KeyboardMode::Simplex,
-    }
-}
+const OUTPUTS: [(OutputScript, &str); 2] = [
+    (OutputScript::Traditional, "繁"),
+    (OutputScript::Simplified, "簡"),
+];
 
 fn has_simplex_composition(state: &AppState) -> bool {
-    state.mode == Mode::Simplex
-        && (!state.codes.is_empty() || !state.current_candidates().is_empty())
+    state.ime.mode == Mode::Simplex
+        && (!state.ime.codes.is_empty() || !state.current_candidates().is_empty())
+}
+
+/// The candidate bar at the top currently belongs to 九方 (the 九方 layout)
+/// rather than 速成.
+fn q9_bar(state: &AppState) -> bool {
+    state.ime.mode == Mode::Jiufang
+}
+
+/// The overlay is drawn and takes clicks inside its rect.
+fn overlay_shown(state: &AppState) -> bool {
+    state.ime.overlay_open && state.ime.mode != Mode::Jiufang
 }
 
 fn make_int_resource(id: u16) -> PCWSTR {
     PCWSTR(id as usize as *const u16)
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    Cp437,
-    Simplex,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -290,6 +323,19 @@ enum Hit {
     Opacity,
     Brand,
     AsciiSpace,
+    /// 九方 pad key 0–9 (on the 九方 layout, or in the overlay).
+    Q9(u8),
+    /// Overlay action keys and paging (CP437 / 速成 only; on the 九方 layout
+    /// the regular 刪碼 / 清除 / 空格 / page keys act on 九方).
+    OvDelete,
+    OvClear,
+    OvSpace,
+    OvPrev,
+    OvNext,
+    /// `繁｜簡` segment.
+    Output(OutputScript),
+    /// 數墊 capture toggle.
+    NumpadToggle,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -427,10 +473,9 @@ unsafe fn draw_key_body(
 }
 
 struct AppState {
-    mode: Mode,
+    /// Visible layout, 速成 / 九方 compositions, overlay, 繁簡 and 數墊.
+    ime: ime::Ime,
     symbols_open: bool,
-    codes: String,
-    page: usize,
     hover: Option<Hit>,
     pressed: Option<Hit>,
     last_typed_cp437: Option<u8>,
@@ -445,6 +490,8 @@ struct AppState {
     /// 速成 layout for the last (width, height, DPI, symbols_open). Rebuilt
     /// only when one of those changes, so hover / hit-test / paint don't allocate.
     simplex_cache: RefCell<Option<(LayoutKey, Rc<SimplexLayout>)>>,
+    /// 九方 layout, cached the same way.
+    jiufang_cache: RefCell<Option<(LayoutKey, Rc<JiufangLayout>)>>,
     /// Off-screen buffer kept across paints so only dirty rects are redrawn.
     backbuf: Option<BackBuffer>,
 }
@@ -474,10 +521,8 @@ impl AppState {
     fn new() -> WinResult<Self> {
         unsafe {
             Ok(Self {
-                mode: Mode::Cp437,
+                ime: ime::Ime::new(Mode::Cp437),
                 symbols_open: false,
-                codes: String::new(),
-                page: 0,
                 hover: None,
                 pressed: None,
                 last_typed_cp437: None,
@@ -503,15 +548,17 @@ impl AppState {
                 },
                 font_key: (0, 0, 0, 255),
                 simplex_cache: RefCell::new(None),
+                jiufang_cache: RefCell::new(None),
                 backbuf: None,
             })
         }
     }
 
     fn min_client(&self) -> (i32, i32) {
-        match self.mode {
+        match self.ime.mode {
             Mode::Cp437 => (dp(prefs::MIN_CLIENT_W), dp(prefs::MIN_CLIENT_H)),
             Mode::Simplex => (dp(prefs::MIN_CLIENT_W), simplex_min_client_h()),
+            Mode::Jiufang => (dp(prefs::MIN_CLIENT_W), jiufang_min_client_h()),
         }
     }
 
@@ -540,54 +587,62 @@ impl AppState {
         }
     }
 
-    fn mode_segment_rect(client: RECT, which: Mode) -> RECT {
+    /// Vertical extent shared by every bottom-bar control.
+    fn bar_y(client: RECT) -> (i32, i32) {
         let status = Self::status_rect(client);
-        let y0 = status.top + dp(3);
-        let y1 = status.bottom - dp(3);
-        let x0 = status.left + dp(8);
-        let seg_w = dp(MODE_SEG_W);
-        match which {
-            Mode::Cp437 => RECT {
-                left: x0,
-                top: y0,
-                right: x0 + seg_w,
-                bottom: y1,
-            },
-            Mode::Simplex => RECT {
-                left: x0 + seg_w,
-                top: y0,
-                right: x0 + seg_w * 2,
-                bottom: y1,
-            },
+        (status.top + dp(3), status.bottom - dp(3))
+    }
+
+    fn bar_rect(client: RECT, left: i32, w: i32) -> RECT {
+        let (top, bottom) = Self::bar_y(client);
+        RECT {
+            left,
+            top,
+            right: left + w,
+            bottom,
         }
+    }
+
+    /// Three-segment `CP437｜速成｜九方`, always in that order.
+    fn mode_segment_rect(client: RECT, which: Mode) -> RECT {
+        let i = match which {
+            Mode::Cp437 => 0,
+            Mode::Simplex => 1,
+            Mode::Jiufang => 2,
+        };
+        let seg_w = dp(MODE_SEG_W);
+        Self::bar_rect(client, dp(BAR_PAD) + seg_w * i, seg_w)
     }
 
     fn opacity_rect(client: RECT) -> RECT {
-        let status = Self::status_rect(client);
-        let y0 = status.top + dp(3);
-        let y1 = status.bottom - dp(3);
-        let x0 = status.left + dp(8 + MODE_SEG_W * 2 + 8);
-        RECT {
-            left: x0,
-            top: y0,
-            right: x0 + dp(OPACITY_BTN_W),
-            bottom: y1,
-        }
+        let x0 = Self::mode_segment_rect(client, Mode::Jiufang).right + dp(BAR_GAP);
+        Self::bar_rect(client, x0, dp(OPACITY_BTN_W))
     }
 
+    /// Two-segment `繁｜簡`, after the opacity button.
+    fn output_segment_rect(client: RECT, which: OutputScript) -> RECT {
+        let x0 = Self::opacity_rect(client).right + dp(BAR_GAP);
+        let seg_w = dp(OUTPUT_SEG_W);
+        let i = match which {
+            OutputScript::Traditional => 0,
+            OutputScript::Simplified => 1,
+        };
+        Self::bar_rect(client, x0 + seg_w * i, seg_w)
+    }
+
+    /// 數墊 capture toggle, after `繁｜簡`.
+    fn numpad_toggle_rect(client: RECT) -> RECT {
+        let x0 = Self::output_segment_rect(client, OutputScript::Simplified).right + dp(BAR_GAP);
+        Self::bar_rect(client, x0, dp(NUMPAD_BTN_W))
+    }
+
+    /// Wide Space on the right; never narrower than `SPACE_BAR_MIN_W`.
     fn space_bar_rect(client: RECT) -> RECT {
         let status = Self::status_rect(client);
-        let y0 = status.top + dp(3);
-        let y1 = status.bottom - dp(3);
-        let x0 = Self::opacity_rect(client).right + dp(8);
-        let avail = (status.right - dp(8) - x0).max(dp(SPACE_BAR_MIN_W));
+        let x0 = Self::numpad_toggle_rect(client).right + dp(BAR_GAP);
+        let avail = (status.right - dp(BAR_PAD) - x0).max(dp(SPACE_BAR_MIN_W));
         let space_w = avail.clamp(dp(SPACE_BAR_MIN_W), dp(SPACE_BAR_MAX_W));
-        RECT {
-            left: x0,
-            top: y0,
-            right: x0 + space_w,
-            bottom: y1,
-        }
+        Self::bar_rect(client, x0, space_w)
     }
 
     /// Full-width hint row sitting directly above the control bar.
@@ -651,14 +706,40 @@ impl AppState {
     }
 
     fn current_candidates(&self) -> &'static [char] {
-        if self.mode != Mode::Simplex || self.symbols_open {
+        if self.ime.mode != Mode::Simplex || self.symbols_open {
             return &[];
         }
-        simplex::candidates(&self.codes)
+        simplex::candidates(&self.ime.codes)
     }
 
     fn current_page_items(&self) -> &'static [char] {
-        simplex::page_slice(self.current_candidates(), self.page)
+        simplex::page_slice(self.current_candidates(), self.ime.page)
+    }
+
+    /// Items in the top candidate bar for whichever method owns it.
+    fn bar_items(&self) -> &'static [char] {
+        if q9_bar(self) {
+            self.ime.q9.page_items(q9::active())
+        } else {
+            self.current_page_items()
+        }
+    }
+
+    /// The candidate that 空格 would commit, or the hovered one: the
+    /// "current pick" for the 繁／簡 no-mapping hint.
+    fn current_pick(&self) -> Option<char> {
+        let q9_items = || self.ime.q9.page_items(q9::active());
+        match self.hover {
+            Some(Hit::Candidate(i)) => self.bar_items().get(i as usize).copied(),
+            Some(Hit::Q9(k)) if k > 0 && self.ime.q9.code().is_some() => {
+                q9_items().get(usize::from(k) - 1).copied()
+            }
+            _ if self.ime.q9_live() && self.ime.q9.code().is_some() => q9_items().first().copied(),
+            _ if self.ime.mode == Mode::Simplex && !self.ime.overlay_open => {
+                self.current_page_items().first().copied()
+            }
+            _ => None,
+        }
     }
 }
 
@@ -745,6 +826,306 @@ fn simplex_min_client_h() -> i32 {
         + dp(HINT_ROW_MIN_H)
         + dp(28);
     needed.max(dp(prefs::MIN_CLIENT_H))
+}
+
+/// Digit row (`1–9 0` + Bksp) and fullwidth punctuation / nav row, as on the
+/// 速成 layout, starting at `top`. Returns the rows and their bottom edge.
+type AuxRows = (
+    Vec<(char, RECT)>,
+    RECT,
+    Vec<(char, RECT)>,
+    Vec<(NavKey, RECT)>,
+    i32,
+);
+
+fn aux_rows(left: i32, right: i32, top: i32) -> AuxRows {
+    let key_gap = dp(KEY_GAP);
+    let row_gap = dp(SIMPLEX_GAP);
+    let aux_row_h = dp(AUX_ROW_H);
+    let usable = right - left;
+    let unit = ((usable - 10 * key_gap) as f32 / 11.6).max(dp(14) as f32);
+    let digit_w = unit as i32;
+    let bksp_w = ((unit * 1.6) as i32).max(digit_w + dp(8));
+    let total = digit_w * 10 + bksp_w + 10 * key_gap;
+    let x0 = left + (usable - total).max(0) / 2;
+    let row = |x: i32, w: i32, y: i32| RECT {
+        left: x,
+        top: y,
+        right: x + w,
+        bottom: y + aux_row_h,
+    };
+    let digits: Vec<(char, RECT)> = DIGIT_CHARS
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(i, ch)| (ch, row(x0 + (i as i32) * (digit_w + key_gap), digit_w, top)))
+        .collect();
+    let backspace = row(x0 + 10 * (digit_w + key_gap), bksp_w, top);
+    let y2 = top + aux_row_h + row_gap;
+    let aux2 = RECT {
+        left,
+        top: y2,
+        right,
+        bottom: y2 + aux_row_h,
+    };
+    let aux2_w = ((usable - 7 * key_gap) / 8).max(dp(16));
+    let keys = centered_keys(aux2, 8, aux2_w);
+    let puncts = PUNCT_CHARS
+        .iter()
+        .copied()
+        .zip(keys.iter().copied())
+        .collect();
+    let navs = NavKey::ALL
+        .iter()
+        .copied()
+        .zip(keys.iter().copied().skip(4))
+        .collect();
+    (digits, backspace, puncts, navs, aux2.bottom)
+}
+
+/// Lowercase English rows filling `top..bottom` (clamped like 速成).
+fn english_rows(left: i32, right: i32, top: i32, bottom: i32) -> (Vec<(char, RECT)>, i32) {
+    let key_gap = dp(KEY_GAP);
+    let row_gap = dp(SIMPLEX_GAP);
+    let usable = right - left;
+    let avail = (bottom - top).max(1);
+    let english_h = ((avail - 2 * row_gap) / 3).clamp(dp(ENGLISH_ROW_MIN_H), dp(ENGLISH_ROW_MAX_H));
+    let en_key_w = ((usable - 9 * key_gap) / 10).max(dp(14));
+    let unit = en_key_w + key_gap;
+    let block_w = en_key_w * 10 + key_gap * 9;
+    let x_base = left + (usable - block_w).max(0) / 2;
+    let mut english = Vec::new();
+    for (i, row_chars) in ENGLISH_ROWS.iter().enumerate() {
+        let row_top = top + (i as i32) * (english_h + row_gap);
+        let indent = match i {
+            1 => unit / 2,
+            2 => unit,
+            _ => 0,
+        };
+        for (j, ch) in row_chars.iter().copied().enumerate() {
+            let x = x_base + indent + (j as i32) * unit;
+            english.push((
+                ch,
+                RECT {
+                    left: x,
+                    top: row_top,
+                    right: x + en_key_w,
+                    bottom: row_top + english_h,
+                },
+            ));
+        }
+    }
+    (english, english_h)
+}
+
+/// Computer-numpad pad: 7 8 9 / 4 5 6 / 1 2 3 and a wide 0 under columns
+/// 1–2. `pad[k]` is the rect of key `k`.
+fn pad_rects(area: RECT, key_w: i32, row_h: i32) -> [RECT; 10] {
+    let gap = dp(KEY_GAP);
+    let total_w = key_w * 3 + gap * 2;
+    let x0 = area.left + ((area.right - area.left) - total_w).max(0) / 2;
+    let mut pad = [RECT::default(); 10];
+    for (r, row) in q9::PAD_ROWS.iter().enumerate() {
+        for (c, key) in row.iter().enumerate() {
+            let left = x0 + (c as i32) * (key_w + gap);
+            let top = area.top + (r as i32) * (row_h + gap);
+            pad[usize::from(*key)] = RECT {
+                left,
+                top,
+                right: left + key_w,
+                bottom: top + row_h,
+            };
+        }
+    }
+    let top = area.top + 3 * (row_h + gap);
+    pad[0] = RECT {
+        left: x0,
+        top,
+        right: x0 + key_w * 2 + gap,
+        bottom: top + row_h,
+    };
+    pad
+}
+
+/// Minimum 九方 client height in physical pixels (rows scaled one by one,
+/// as in `jiufang_layout`).
+fn jiufang_min_client_h() -> i32 {
+    let gap = dp(SIMPLEX_GAP);
+    let needed = dp(CANDIDATE_ROW_H + 2)
+        + gap
+        + dp(Q9_ROW_MIN_H) * 4
+        + dp(KEY_GAP) * 3
+        + gap
+        + dp(AUX_ROW_H) * 2
+        + gap
+        + gap
+        + dp(ENGLISH_ROW_MIN_H) * 3
+        + gap * 2
+        + gap
+        + dp(ACTION_ROW_H)
+        + dp(2)
+        + dp(HINT_ROW_MIN_H)
+        + dp(28);
+    needed.max(dp(prefs::MIN_CLIENT_H))
+}
+
+/// The 九方 layout: candidate bar on top (shared with 速成), the 3×3 + wide
+/// 0 pad, the digit / punctuation / Bksp rows, the compact English rows, and
+/// an action row 刪碼 · 清除 · 空格.
+struct JiufangLayout {
+    pad: [RECT; 10],
+    digits: Vec<(char, RECT)>,
+    backspace: RECT,
+    puncts: Vec<(char, RECT)>,
+    navs: Vec<(NavKey, RECT)>,
+    english: Vec<(char, RECT)>,
+    actions: Vec<(Hit, &'static str, RECT)>,
+    pad_h: i32,
+    english_h: i32,
+}
+
+fn jiufang_layout(client: RECT) -> JiufangLayout {
+    let key_gap = dp(KEY_GAP);
+    let row_gap = dp(SIMPLEX_GAP);
+    let left = dp(GRID_PAD);
+    let right = (client.right - dp(GRID_PAD)).max(left + dp(40));
+    let usable = right - left;
+
+    let status = AppState::footer_h(client.bottom - client.top);
+    let action_bottom = client.bottom - status - dp(2);
+    let action_top = action_bottom - dp(ACTION_ROW_H);
+    let action_row = RECT {
+        left,
+        top: action_top,
+        right,
+        bottom: action_bottom,
+    };
+    let action_w = ((usable - 2 * key_gap) / 3).clamp(dp(40), dp(72));
+    let recs = centered_keys(action_row, 3, action_w);
+    let actions = vec![
+        (Hit::Delete, "刪碼", recs[0]),
+        (Hit::Clear, "清除", recs[1]),
+        (Hit::Space, "空格", recs[2]),
+    ];
+
+    let pad_top = dp(CANDIDATE_ROW_H + 2) + row_gap;
+    let below = dp(AUX_ROW_H) * 2
+        + row_gap * 2
+        + row_gap
+        + dp(ENGLISH_ROW_MIN_H) * 3
+        + row_gap * 2
+        + row_gap;
+    let pad_avail = (action_top - pad_top - below).max(1);
+    let pad_h = ((pad_avail - 3 * key_gap) / 4).clamp(dp(Q9_ROW_MIN_H), dp(Q9_ROW_MAX_H));
+    let key_w = ((usable - 2 * key_gap) / 3).min(dp(Q9_KEY_MAX_W));
+    let pad_area = RECT {
+        left,
+        top: pad_top,
+        right,
+        bottom: pad_top + pad_h * 4 + key_gap * 3,
+    };
+    let pad = pad_rects(pad_area, key_w, pad_h);
+
+    let (digits, backspace, puncts, navs, aux_bottom) =
+        aux_rows(left, right, pad_area.bottom + row_gap);
+    let (english, english_h) =
+        english_rows(left, right, aux_bottom + row_gap, action_top - row_gap);
+
+    JiufangLayout {
+        pad,
+        digits,
+        backspace,
+        puncts,
+        navs,
+        english,
+        actions,
+        pad_h,
+        english_h,
+    }
+}
+
+/// Focus-free 九方 overlay panel drawn inside the main window over the
+/// mid-upper keyboard (CP437 grid or 速成 radicals). It covers the 速成
+/// candidate row, and never the hint row or the bottom control bar.
+struct OverlayLayout {
+    panel: RECT,
+    header: RECT,
+    pad: [RECT; 10],
+    del: RECT,
+    clear: RECT,
+    space: RECT,
+    prev: RECT,
+    next: RECT,
+}
+
+fn overlay_layout(client: RECT) -> OverlayLayout {
+    let pad = dp(OV_PAD);
+    let gap = dp(KEY_GAP);
+    let footer_top = AppState::footer_rect(client).top;
+    let row_h = dp(OV_ROW_H);
+    let want_h = pad * 2 + dp(OV_HEADER_H) + gap + row_h * 4 + gap * 3 + gap + dp(OV_ACTION_H);
+    let panel = RECT {
+        left: dp(4),
+        top: dp(4),
+        right: (client.right - dp(4)).max(dp(40)),
+        bottom: (dp(4) + want_h).min(footer_top - dp(4)),
+    };
+    let inner_l = panel.left + pad;
+    let inner_r = panel.right - pad;
+    let header = RECT {
+        left: inner_l,
+        top: panel.top + pad,
+        right: inner_r,
+        bottom: panel.top + pad + dp(OV_HEADER_H),
+    };
+    let action_bottom = panel.bottom - pad;
+    let action_top = action_bottom - dp(OV_ACTION_H);
+    // Rows shrink if the window is unusually short, never below 20 dip.
+    let rows_avail = action_top - gap - (header.bottom + gap) - gap * 3;
+    let row_h = (rows_avail / 4).clamp(dp(20), row_h);
+    let key_w = ((inner_r - inner_l - 2 * gap) / 3).min(dp(100));
+    let pad_area = RECT {
+        left: inner_l,
+        top: header.bottom + gap,
+        right: inner_r,
+        bottom: header.bottom + gap + row_h * 4 + gap * 3,
+    };
+    let keys = pad_rects(pad_area, key_w, row_h);
+    let actions = centered_keys(
+        RECT {
+            left: inner_l,
+            top: action_top,
+            right: inner_r,
+            bottom: action_bottom,
+        },
+        5,
+        ((inner_r - inner_l - 4 * gap) / 5).clamp(dp(30), dp(72)),
+    );
+    OverlayLayout {
+        panel,
+        header,
+        pad: keys,
+        del: actions[0],
+        clear: actions[1],
+        space: actions[2],
+        prev: actions[3],
+        next: actions[4],
+    }
+}
+
+impl OverlayLayout {
+    fn hits(&self) -> [(Hit, RECT); 15] {
+        let mut out = [(Hit::OvDelete, RECT::default()); 15];
+        for k in 0..10u8 {
+            out[usize::from(k)] = (Hit::Q9(k), self.pad[usize::from(k)]);
+        }
+        out[10] = (Hit::OvDelete, self.del);
+        out[11] = (Hit::OvClear, self.clear);
+        out[12] = (Hit::OvSpace, self.space);
+        out[13] = (Hit::OvPrev, self.prev);
+        out[14] = (Hit::OvNext, self.next);
+        out
+    }
 }
 
 struct SimplexLayout {
@@ -979,8 +1360,27 @@ impl AppState {
         layout
     }
 
+    fn jlayout(&self, client: RECT) -> Rc<JiufangLayout> {
+        let key = (
+            client.right - client.left,
+            client.bottom - client.top,
+            current_dpi(),
+            false,
+        );
+        let mut cache = self.jiufang_cache.borrow_mut();
+        if let Some((k, layout)) = cache.as_ref() {
+            if *k == key {
+                return Rc::clone(layout);
+            }
+        }
+        let layout = Rc::new(jiufang_layout(client));
+        *cache = Some((key, Rc::clone(&layout)));
+        layout
+    }
+
     fn invalidate_layout(&self) {
         *self.simplex_cache.borrow_mut() = None;
+        *self.jiufang_cache.borrow_mut() = None;
     }
 
     /// Screen rect a hit target is drawn in, used to repaint just that key.
@@ -991,6 +1391,21 @@ impl AppState {
             Hit::Mode(m) => Some(Self::mode_segment_rect(client, m)),
             Hit::Opacity => Some(Self::opacity_rect(client)),
             Hit::AsciiSpace => Some(Self::space_bar_rect(client)),
+            Hit::Output(o) => Some(Self::output_segment_rect(client, o)),
+            Hit::NumpadToggle => Some(Self::numpad_toggle_rect(client)),
+            Hit::Q9(k) => {
+                if overlay_shown(self) {
+                    Some(overlay_layout(client).pad[usize::from(k.min(9))])
+                } else if self.ime.mode == Mode::Jiufang {
+                    Some(self.jlayout(client).pad[usize::from(k.min(9))])
+                } else {
+                    None
+                }
+            }
+            Hit::OvDelete | Hit::OvClear | Hit::OvSpace | Hit::OvPrev | Hit::OvNext => {
+                let ov = overlay_layout(client);
+                ov.hits().iter().find(|(h, _)| *h == hit).map(|(_, r)| *r)
+            }
             Hit::Brand | Hit::PagePrev | Hit::PageNext | Hit::Candidate(_) => {
                 let (brand, _, slots, prev, next) = candidate_parts(client);
                 Some(match hit {
@@ -1001,7 +1416,23 @@ impl AppState {
                     _ => unreachable!(),
                 })
             }
-            _ if self.mode != Mode::Simplex => None,
+            _ if self.ime.mode == Mode::Jiufang => {
+                let l = self.jlayout(client);
+                match hit {
+                    Hit::Backspace => Some(l.backspace),
+                    Hit::Digit(c) => find(&l.digits, c),
+                    Hit::Punct(c) => find(&l.puncts, c),
+                    Hit::Latin(c) => find(&l.english, c),
+                    Hit::Nav(n) => l.navs.iter().find(|(k, _)| *k == n).map(|(_, r)| *r),
+                    Hit::Delete | Hit::Clear | Hit::Space => l
+                        .actions
+                        .iter()
+                        .find(|(k, _, _)| *k == hit)
+                        .map(|(_, _, r)| *r),
+                    _ => None,
+                }
+            }
+            _ if self.ime.mode != Mode::Simplex => None,
             Hit::Backspace => Some(self.layout(client).backspace),
             Hit::Digit(c) => find(&self.layout(client).digits, c),
             Hit::Punct(c) => find(&self.layout(client).puncts, c),
@@ -1029,7 +1460,7 @@ impl AppState {
     }
 
     fn hit_test(&self, client: RECT, x: i32, y: i32) -> Option<Hit> {
-        for m in [Mode::Cp437, Mode::Simplex] {
+        for (m, _) in MODES {
             if pt_in(AppState::mode_segment_rect(client, m), x, y) {
                 return Some(Hit::Mode(m));
             }
@@ -1037,10 +1468,74 @@ impl AppState {
         if pt_in(AppState::opacity_rect(client), x, y) {
             return Some(Hit::Opacity);
         }
+        for (o, _) in OUTPUTS {
+            if pt_in(AppState::output_segment_rect(client, o), x, y) {
+                return Some(Hit::Output(o));
+            }
+        }
+        if pt_in(AppState::numpad_toggle_rect(client), x, y) {
+            return Some(Hit::NumpadToggle);
+        }
         if pt_in(AppState::space_bar_rect(client), x, y) {
             return Some(Hit::AsciiSpace);
         }
-        if self.mode == Mode::Simplex {
+        if overlay_shown(self) {
+            let ov = overlay_layout(client);
+            if pt_in(ov.panel, x, y) {
+                // Inside the panel only overlay controls answer; the keys
+                // underneath are covered.
+                return ov
+                    .hits()
+                    .iter()
+                    .find(|(_, r)| pt_in(*r, x, y))
+                    .map(|(h, _)| *h);
+            }
+        }
+        if self.ime.mode == Mode::Jiufang {
+            let (brand, _, slots, prev, next) = candidate_parts(client);
+            if pt_in(brand, x, y) {
+                return Some(Hit::Brand);
+            }
+            if pt_in(prev, x, y) {
+                return Some(Hit::PagePrev);
+            }
+            if pt_in(next, x, y) {
+                return Some(Hit::PageNext);
+            }
+            for (i, rc) in slots.iter().enumerate() {
+                if pt_in(*rc, x, y) {
+                    return Some(Hit::Candidate(i as u8));
+                }
+            }
+            let l = self.jlayout(client);
+            for (k, rc) in l.pad.iter().enumerate() {
+                if pt_in(*rc, x, y) {
+                    return Some(Hit::Q9(k as u8));
+                }
+            }
+            if pt_in(l.backspace, x, y) {
+                return Some(Hit::Backspace);
+            }
+            let find =
+                |v: &[(char, RECT)]| v.iter().find(|(_, r)| pt_in(*r, x, y)).map(|(c, _)| *c);
+            if let Some(c) = find(&l.digits) {
+                return Some(Hit::Digit(c));
+            }
+            if let Some(c) = find(&l.puncts) {
+                return Some(Hit::Punct(c));
+            }
+            if let Some((n, _)) = l.navs.iter().find(|(_, r)| pt_in(*r, x, y)) {
+                return Some(Hit::Nav(*n));
+            }
+            if let Some((h, _, _)) = l.actions.iter().find(|(_, _, r)| pt_in(*r, x, y)) {
+                return Some(*h);
+            }
+            if let Some(c) = find(&l.english) {
+                return Some(Hit::Latin(c));
+            }
+            return None;
+        }
+        if self.ime.mode == Mode::Simplex {
             let (brand, codes, slots, prev, next) = candidate_parts(client);
             let _ = codes;
             if pt_in(brand, x, y) {
@@ -1122,18 +1617,26 @@ impl AppState {
     }
 
     unsafe fn ensure_fonts(&mut self, client: RECT) {
-        let (key_h, english_h) = if self.mode == Mode::Cp437 {
-            let grid = Self::grid_rect(client);
-            (((grid.bottom - grid.top) / ROWS).max(1), 0)
-        } else {
-            let layout = self.layout(client);
-            (layout.letter_h.max(1), layout.english_h.max(1))
+        let (key_h, english_h) = match self.ime.mode {
+            Mode::Cp437 => {
+                let grid = Self::grid_rect(client);
+                (((grid.bottom - grid.top) / ROWS).max(1), 0)
+            }
+            Mode::Simplex => {
+                let layout = self.layout(client);
+                (layout.letter_h.max(1), layout.english_h.max(1))
+            }
+            Mode::Jiufang => {
+                let layout = self.jlayout(client);
+                (layout.pad_h.max(1), layout.english_h.max(1))
+            }
         };
         let cand_h = dp(CANDIDATE_ROW_H);
-        let mode_tag = match (self.mode, self.symbols_open) {
+        let mode_tag = match (self.ime.mode, self.symbols_open) {
             (Mode::Cp437, _) => 0,
             (Mode::Simplex, false) => 1,
             (Mode::Simplex, true) => 2,
+            (Mode::Jiufang, _) => 3,
         };
         // cand_h is DPI-scaled, so a DPI change alone also rebuilds fonts.
         let key = (key_h, cand_h, english_h, mode_tag);
@@ -1144,7 +1647,7 @@ impl AppState {
         self.font_key = key;
         let glyph_h = (key_h as f32 * 0.46).round() as i32;
         let caption_h = (key_h as f32 * 0.20).round() as i32;
-        let named_h = if self.mode == Mode::Simplex {
+        let named_h = if self.ime.mode != Mode::Cp437 {
             (dp(ACTION_ROW_H) as f32 * 0.50).round() as i32
         } else {
             (key_h as f32 * 0.26).round() as i32
@@ -1166,7 +1669,7 @@ impl AppState {
         self.fonts.caption = create_font("Segoe UI", clamp(caption_h, 9, 22), FW_NORMAL.0 as i32);
         self.fonts.named = create_font(
             "Microsoft JhengHei",
-            if self.mode == Mode::Simplex {
+            if self.ime.mode != Mode::Cp437 {
                 clamp(named_h, 10, 14)
             } else {
                 clamp(named_h, 10, 28)
@@ -1280,6 +1783,12 @@ fn prefs_path() -> Option<PathBuf> {
     Some(PathBuf::from(appdata).join("on99KB").join("window.ini"))
 }
 
+/// Optional user 九方 table (same format as `data/jiufang-shape.txt`).
+fn jiufang_table_path() -> Option<PathBuf> {
+    let appdata = std::env::var_os("APPDATA")?;
+    Some(PathBuf::from(appdata).join("on99KB").join("jiufang.txt"))
+}
+
 fn load_prefs() -> Option<prefs::WindowPrefs> {
     let path = prefs_path()?;
     let text = std::fs::read_to_string(path).ok()?;
@@ -1299,12 +1808,30 @@ fn save_prefs(hwnd: HWND) {
     unsafe {
         let _ = GetWindowRect(hwnd, &mut wr);
     }
-    let (opacity, topmost, mode) = state_mut(hwnd)
-        .map(|s| (s.opacity, s.topmost, mode_to_prefs(s.mode)))
-        .unwrap_or((prefs::Opacity::DEFAULT, true, prefs::KeyboardMode::DEFAULT));
-    let Some(p) = prefs::sanitize(w, h, Some(wr.left), Some(wr.top), opacity, topmost, mode) else {
+    // `mode` is the visible layout only; the numpad overlay never changes it.
+    let (opacity, topmost, mode, output, numpad_capture) = state_mut(hwnd)
+        .map(|s| {
+            (
+                s.opacity,
+                s.topmost,
+                s.ime.mode,
+                s.ime.output,
+                s.ime.numpad_capture,
+            )
+        })
+        .unwrap_or((
+            prefs::Opacity::DEFAULT,
+            true,
+            prefs::KeyboardMode::DEFAULT,
+            OutputScript::DEFAULT,
+            prefs::NUMPAD_CAPTURE_DEFAULT,
+        ));
+    let Some(mut p) = prefs::sanitize(w, h, Some(wr.left), Some(wr.top), opacity, topmost, mode)
+    else {
         return;
     };
+    p.output = output;
+    p.numpad_capture = numpad_capture;
     let Some(path) = prefs_path() else {
         return;
     };
@@ -1390,14 +1917,16 @@ fn wheel_delta(wparam: WPARAM) -> i16 {
 }
 
 fn simplex_page_prev(state: &mut AppState) {
-    if !state.symbols_open && simplex::can_page_prev(state.page) {
-        state.page -= 1;
+    if !state.symbols_open && simplex::can_page_prev(state.ime.page) {
+        state.ime.page -= 1;
     }
 }
 
 fn simplex_page_next(state: &mut AppState) {
-    if !state.symbols_open && simplex::can_page_next(state.current_candidates().len(), state.page) {
-        state.page += 1;
+    if !state.symbols_open
+        && simplex::can_page_next(state.current_candidates().len(), state.ime.page)
+    {
+        state.ime.page += 1;
     }
 }
 
@@ -1430,11 +1959,23 @@ fn set_title(hwnd: HWND, mode: Mode) {
     }
 }
 
-fn commit_char(state: &mut AppState, ch: char) {
-    let _ = send_unicode(ch);
-    state.last_typed = Some(ch);
-    state.codes.clear();
-    state.page = 0;
+/// Carry out what the composition layer asked for.
+fn apply_action(state: &mut AppState, action: Action) {
+    match action {
+        Action::Commit(ch) => {
+            let _ = send_unicode(ch);
+            state.last_typed = Some(ch);
+        }
+        Action::SendBackspace => {
+            let _ = send_vk(VK_BACK, false);
+        }
+        Action::None => {}
+    }
+}
+
+/// Install or remove the numpad hook to match 數墊 and the window state.
+fn sync_hook(hwnd: HWND, state: &AppState) {
+    hook::sync(hwnd, state.ime.numpad_capture);
 }
 
 fn activate_hit(hwnd: HWND, state: &mut AppState, hit: Hit) {
@@ -1457,11 +1998,8 @@ fn activate_hit(hwnd: HWND, state: &mut AppState, hit: Hit) {
             }
         }
         Hit::Mode(mode) => {
-            if state.mode != mode {
-                state.mode = mode;
+            if state.ime.set_mode(mode) {
                 state.symbols_open = false;
-                state.codes.clear();
-                state.page = 0;
                 state.hover = None;
                 state.latin_shifted = false;
                 kill_latin_timer(hwnd);
@@ -1471,39 +2009,78 @@ fn activate_hit(hwnd: HWND, state: &mut AppState, hit: Hit) {
                 save_prefs(hwnd);
             }
         }
+        Hit::Output(o) => {
+            if state.ime.output != o {
+                // Output script only: no IME / keyboard-layout change, and
+                // in-progress codes are untouched.
+                state.ime.output = o;
+                save_prefs(hwnd);
+            }
+        }
+        Hit::NumpadToggle => {
+            state.ime.numpad_capture = !state.ime.numpad_capture;
+            sync_hook(hwnd, state);
+            save_prefs(hwnd);
+        }
         Hit::Letter(ch) => {
-            if simplex::push_code(&mut state.codes, ch) {
-                state.page = 0;
-            }
+            state.ime.simplex_letter(ch);
         }
-        Hit::Delete => {
-            if simplex::pop_code(&mut state.codes) {
-                state.page = 0;
-            }
+        Hit::Delete if q9_bar(state) => {
+            state.ime.q9_delete();
         }
-        Hit::Clear => {
-            state.codes.clear();
-            state.page = 0;
+        Hit::Delete => state.ime.simplex_delete(),
+        Hit::Clear if q9_bar(state) => {
+            state.ime.q9_clear();
+        }
+        Hit::Clear => state.ime.simplex_clear(),
+        Hit::Space if q9_bar(state) => {
+            let a = state.ime.q9_space(q9::active());
+            apply_action(state, a);
         }
         Hit::Space => {
-            if !state.symbols_open {
+            if !state.symbols_open && !state.ime.overlay_open {
                 if let Some(ch) = state.current_page_items().first().copied() {
-                    commit_char(state, ch);
+                    let a = state.ime.simplex_commit(ch);
+                    apply_action(state, a);
                 }
             }
+        }
+        Hit::Candidate(i) if q9_bar(state) => {
+            let a = state.ime.q9_candidate(i as usize, q9::active());
+            apply_action(state, a);
         }
         Hit::Candidate(i) => {
-            if !state.symbols_open {
+            if !state.symbols_open && !state.ime.overlay_open {
                 if let Some(ch) = state.current_page_items().get(i as usize).copied() {
-                    commit_char(state, ch);
+                    let a = state.ime.simplex_commit(ch);
+                    apply_action(state, a);
                 }
             }
         }
+        // 九方 上頁／下頁 wrap like key 0 and the wheel; 速成 stops at the ends.
+        Hit::PagePrev if q9_bar(state) => state.ime.q9_prev_page(q9::active()),
+        Hit::PageNext if q9_bar(state) => state.ime.q9_next_page(q9::active()),
         Hit::PagePrev => simplex_page_prev(state),
         Hit::PageNext => simplex_page_next(state),
+        Hit::Q9(k) => {
+            let a = state.ime.q9_key(k, q9::active());
+            apply_action(state, a);
+        }
+        Hit::OvDelete => {
+            state.ime.q9_delete();
+        }
+        Hit::OvClear => {
+            state.ime.q9_clear();
+        }
+        Hit::OvSpace => {
+            let a = state.ime.q9_space(q9::active());
+            apply_action(state, a);
+        }
+        Hit::OvPrev => state.ime.q9_prev_page(q9::active()),
+        Hit::OvNext => state.ime.q9_next_page(q9::active()),
         Hit::SymbolToggle => {
             state.symbols_open = !state.symbols_open;
-            state.page = 0;
+            state.ime.page = 0;
             state.font_key = (0, 0, 0, 255);
         }
         Hit::Symbol(ch) => {
@@ -1522,12 +2099,9 @@ fn activate_hit(hwnd: HWND, state: &mut AppState, hit: Hit) {
             let _ = send_vk(nav.vk(), true);
         }
         Hit::Backspace => {
-            if has_simplex_composition(state) {
-                state.codes.clear();
-                state.page = 0;
-            } else {
-                let _ = send_vk(VK_BACK, false);
-            }
+            // 九方 composition / overlay first, then 速成, else VK_BACK.
+            let a = state.ime.backspace();
+            apply_action(state, a);
         }
         Hit::AsciiSpace => {
             let _ = send_unicode(' ');
@@ -1619,10 +2193,11 @@ pub fn run() -> WinResult<()> {
             None => (CW_USEDEFAULT, CW_USEDEFAULT),
         };
 
-        let start_mode = saved
-            .as_ref()
-            .map(|p| mode_from_prefs(p.mode))
-            .unwrap_or(Mode::Cp437);
+        let start_mode = saved.as_ref().map(|p| p.mode).unwrap_or(Mode::Cp437);
+        // 九方 table: a user override in %APPDATA%\on99KB\jiufang.txt
+        // replaces the built-in starter table when it has a valid line.
+        let override_text = jiufang_table_path().and_then(|p| std::fs::read_to_string(p).ok());
+        q9::install(q9::load_table(override_text.as_deref()));
         let title = wide(title_for(start_mode));
         let hwnd = CreateWindowExW(
             app_ex_style(topmost),
@@ -1661,10 +2236,12 @@ pub fn run() -> WinResult<()> {
         let _ = SetWindowPos(hwnd, HWND::default(), x, y, win_w, win_h, flags);
 
         let mut state = AppState::new()?;
-        state.mode = start_mode;
+        state.ime.mode = start_mode;
         if let Some(p) = saved.as_ref() {
             state.opacity = p.opacity;
             state.topmost = p.topmost;
+            state.ime.output = p.output;
+            state.ime.numpad_capture = p.numpad_capture;
         }
         let opacity = state.opacity;
         let topmost = state.topmost;
@@ -1675,6 +2252,9 @@ pub fn run() -> WinResult<()> {
             apply_mode_min_size(hwnd, state);
         }
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        if let Some(state) = state_mut(hwnd) {
+            sync_hook(hwnd, state);
+        }
 
         let mut msg = MSG::default();
         loop {
@@ -1737,10 +2317,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_SIZE => {
-            if wparam.0 as u32 != SIZE_MINIMIZED {
+            let minimized = wparam.0 as u32 == SIZE_MINIMIZED;
+            if !minimized {
                 schedule_save(hwnd);
             }
             if let Some(state) = state_mut(hwnd) {
+                if minimized {
+                    // Numpad goes back to the target app: drop the overlay
+                    // without committing and remove the hook.
+                    state.ime.on_hidden();
+                }
+                sync_hook(hwnd, state);
                 state.font_key = (0, 0, 0, 255);
                 state.invalidate_layout();
             }
@@ -1775,9 +2362,31 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             LRESULT(0)
         }
+        WM_APP_NUMPAD => {
+            // Posted by the keyboard hook; composition runs here on the UI
+            // thread. No focus or activation change.
+            if let Some(state) = state_mut(hwnd) {
+                if state.ime.numpad_capture && !IsIconic(hwnd).as_bool() {
+                    let a = state
+                        .ime
+                        .numpad_digit((wparam.0 as u8).min(9), q9::active());
+                    apply_action(state, a);
+                    let _ = InvalidateRect(hwnd, None, false);
+                    a11y::notify_reorder(hwnd);
+                }
+            }
+            LRESULT(0)
+        }
         WM_MOUSEWHEEL => {
             if let Some(state) = state_mut(hwnd) {
-                if state.mode == Mode::Simplex {
+                // 九方 (layout or overlay) wraps; 速成 does not.
+                if state
+                    .ime
+                    .q9_wheel(i32::from(wheel_delta(wparam)), q9::active())
+                {
+                    let _ = InvalidateRect(hwnd, None, false);
+                    a11y::notify_reorder(hwnd);
+                } else if state.ime.mode == Mode::Simplex {
                     let delta = wheel_delta(wparam);
                     if delta > 0 {
                         simplex_page_prev(state);
@@ -1889,6 +2498,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_CLOSE => {
+            hook::uninstall();
+            if let Some(state) = state_mut(hwnd) {
+                state.ime.on_hidden();
+            }
             let _ = KillTimer(hwnd, SAVE_TIMER_ID);
             kill_latin_timer(hwnd);
             save_prefs(hwnd);
@@ -1896,6 +2509,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_DESTROY => {
+            hook::uninstall();
             let _ = KillTimer(hwnd, SAVE_TIMER_ID);
             kill_latin_timer(hwnd);
             save_prefs(hwnd);
@@ -2065,7 +2679,7 @@ unsafe fn paint(hwnd: HWND) {
     let old_font = SelectObject(mem, HGDIOBJ(state.fonts.status.0));
     let _ = SetBkMode(mem, TRANSPARENT);
 
-    match state.mode {
+    match state.ime.mode {
         Mode::Cp437 => {
             for code in 0u8..=255 {
                 if rects_overlap(AppState::cell_rect(rc, code), dirty) {
@@ -2076,10 +2690,18 @@ unsafe fn paint(hwnd: HWND) {
         Mode::Simplex => {
             draw_simplex(mem, state, rc, dirty);
         }
+        Mode::Jiufang => {
+            draw_jiufang(mem, state, rc, dirty);
+        }
+    }
+    if overlay_shown(state) && rects_overlap(overlay_layout(rc).panel, dirty) {
+        draw_overlay(mem, state, rc);
     }
 
     draw_mode_switch(mem, state, rc);
     draw_opacity_btn(mem, state, rc);
+    draw_output_switch(mem, state, rc);
+    draw_numpad_toggle(mem, state, rc);
     draw_ascii_space_bar(mem, state, rc);
     draw_hint(mem, state, rc);
 
@@ -2101,10 +2723,100 @@ unsafe fn paint(hwnd: HWND) {
     let _ = EndPaint(hwnd, &ps);
 }
 
+/// One segment of a segmented control (mode, 繁｜簡): selected segments are
+/// filled blue with bright text, the rest are plain keys.
+unsafe fn draw_segment(
+    hdc: HDC,
+    state: &AppState,
+    rc: RECT,
+    label: &str,
+    hit: Hit,
+    selected: bool,
+) {
+    let brush = if selected {
+        state.brushes.selected
+    } else if state.hover == Some(hit) {
+        state.brushes.hover
+    } else {
+        state.brushes.key
+    };
+    let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
+    let _ = RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, dp(6), dp(6));
+    SelectObject(hdc, old_brush);
+    let _ = SelectObject(hdc, HGDIOBJ(state.fonts.status.0));
+    SetTextColor(
+        hdc,
+        if selected {
+            rgb(0xF4, 0xF5, 0xF8)
+        } else {
+            rgb(0xC8, 0xCD, 0xD8)
+        },
+    );
+    let mut text: Vec<u16> = label.encode_utf16().collect();
+    let mut text_rc = RECT {
+        left: rc.left + 1,
+        top: rc.top,
+        right: rc.right - 1,
+        bottom: rc.bottom,
+    };
+    DrawTextW(
+        hdc,
+        &mut text,
+        &mut text_rc,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+    );
+}
+
+unsafe fn draw_output_switch(hdc: HDC, state: &AppState, client: RECT) {
+    for (o, label) in OUTPUTS {
+        let rc = AppState::output_segment_rect(client, o);
+        draw_segment(hdc, state, rc, label, Hit::Output(o), state.ime.output == o);
+    }
+}
+
+/// 數墊 toggle: filled and bright when capture is on, dark and dim when off.
+unsafe fn draw_numpad_toggle(hdc: HDC, state: &AppState, client: RECT) {
+    let rc = AppState::numpad_toggle_rect(client);
+    let hit = Hit::NumpadToggle;
+    let on = state.ime.numpad_capture;
+    let brush = if state.pressed == Some(hit) {
+        state.brushes.pressed
+    } else if state.hover == Some(hit) {
+        state.brushes.hover
+    } else if on {
+        state.brushes.selected
+    } else {
+        state.brushes.disabled
+    };
+    draw_key_body(hdc, state, rc, dp(6), brush, Accent::Control);
+    let _ = SelectObject(hdc, HGDIOBJ(state.fonts.status.0));
+    SetTextColor(
+        hdc,
+        if on {
+            rgb(0xF4, 0xF5, 0xF8)
+        } else {
+            rgb(0x7A, 0x80, 0x8C)
+        },
+    );
+    let mut text: Vec<u16> = "數墊".encode_utf16().collect();
+    let mut text_rc = RECT {
+        left: rc.left + 1,
+        top: rc.top,
+        right: rc.right - 1,
+        bottom: rc.bottom,
+    };
+    DrawTextW(
+        hdc,
+        &mut text,
+        &mut text_rc,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+    );
+}
+
 unsafe fn draw_mode_switch(hdc: HDC, state: &AppState, client: RECT) {
-    for (mode, label) in [(Mode::Cp437, "CP437"), (Mode::Simplex, "速成")] {
+    for (mode, label) in MODES {
         let rc = AppState::mode_segment_rect(client, mode);
-        let brush = if state.mode == mode {
+        let brush = if state.ime.mode == mode {
             state.brushes.selected
         } else if state.hover == Some(Hit::Mode(mode)) {
             state.brushes.hover
@@ -2117,7 +2829,7 @@ unsafe fn draw_mode_switch(hdc: HDC, state: &AppState, client: RECT) {
         let _ = SelectObject(hdc, HGDIOBJ(state.fonts.status.0));
         SetTextColor(
             hdc,
-            if state.mode == mode {
+            if state.ime.mode == mode {
                 rgb(0xF4, 0xF5, 0xF8)
             } else {
                 rgb(0xC8, 0xCD, 0xD8)
@@ -2214,7 +2926,108 @@ unsafe fn draw_hint(hdc: HDC, state: &AppState, client: RECT) {
     );
 }
 
+/// Keys the 九方 layout shares with 速成 (their hints stay the same).
+fn is_shared_key(hit: Option<Hit>) -> bool {
+    matches!(
+        hit,
+        Some(Hit::Latin(_))
+            | Some(Hit::Digit(_))
+            | Some(Hit::Punct(_))
+            | Some(Hit::Nav(_))
+            | Some(Hit::Backspace)
+            | Some(Hit::Opacity)
+            | Some(Hit::AsciiSpace)
+            | Some(Hit::Brand)
+            | Some(Hit::Mode(_))
+    )
+}
+
+fn numpad_hint(state: &AppState) -> String {
+    if state.ime.numpad_capture {
+        "數墊：開  ·  NumLock 開時實體數字鍵盤 0–9 用作九方，唔會輸入數字  ·  點擊關閉".to_string()
+    } else {
+        "數墊：關  ·  實體數字鍵盤照常輸入數字  ·  點擊開啟九方數字鍵".to_string()
+    }
+}
+
+/// Hint for the 九方 pad / overlay: current code, 整體／分體, and what 0 means.
+fn q9_hint(state: &AppState) -> String {
+    let t = q9::active();
+    let c = &state.ime.q9;
+    let code = c.code_text();
+    match c.stage() {
+        q9::Stage::Feature => {
+            if state.ime.numpad_capture {
+                "九方  ·  揀字首左上角特徵 1–9  ·  數墊開：數字鍵盤 0–9 唔會輸入數字".to_string()
+            } else {
+                "九方  ·  揀字首左上角特徵 1–9".to_string()
+            }
+        }
+        q9::Stage::Component(f) => format!(
+            "九方 {code}  ·  揀「{}」下嘅部件 1–9",
+            q9::FEATURES[usize::from(f) - 1]
+        ),
+        q9::Stage::Third(_, _) => {
+            format!("九方 {code}  ·  整體字按 0 確定  ·  分體字按右上角特徵 1–9")
+        }
+        q9::Stage::Candidates(_) => {
+            let class = c.class().map(|k| k.label()).unwrap_or("");
+            let n = c.page_count(t);
+            if n == 0 {
+                format!("九方 {code}  ·  {class}  ·  冇候選字  ·  刪碼 返回")
+            } else {
+                format!(
+                    "九方 {code}  ·  {class}  ·  1–9 選字  ·  0 下頁（{}/{n}）",
+                    c.page() + 1
+                )
+            }
+        }
+    }
+}
+
 fn hint_text(state: &AppState) -> String {
+    if let Some(Hit::Output(o)) = state.hover {
+        let now = match state.ime.output {
+            OutputScript::Traditional => "繁體",
+            OutputScript::Simplified => "簡體",
+        };
+        let target = match o {
+            OutputScript::Traditional => "繁",
+            OutputScript::Simplified => "簡",
+        };
+        return format!(
+            "輸出：{now}  ·  點擊用{target}  ·  只轉速成／九方中文字，唔改 Windows 輸入法"
+        );
+    }
+    if matches!(state.hover, Some(Hit::NumpadToggle)) {
+        return numpad_hint(state);
+    }
+    // 簡 with a pick that has no simplified form (current or just typed).
+    let composing = state.ime.q9_live() || state.ime.mode == Mode::Simplex;
+    if composing
+        && matches!(
+            state.hover,
+            None | Some(Hit::Candidate(_)) | Some(Hit::Q9(_))
+        )
+        && state.ime.no_mapping_hint(state.current_pick())
+    {
+        return script::NO_MAPPING_HINT.to_string();
+    }
+    if overlay_shown(state) || (state.ime.mode == Mode::Jiufang && !is_shared_key(state.hover)) {
+        return match state.hover {
+            Some(Hit::OvDelete) | Some(Hit::Delete) => {
+                "刪碼  ·  刪除最後一個九方碼（唔會送到目標視窗）".to_string()
+            }
+            Some(Hit::OvClear) | Some(Hit::Clear) => "清除  ·  清除九方碼同候選字".to_string(),
+            Some(Hit::OvSpace) | Some(Hit::Space) => {
+                "空格  ·  上本頁第一個候選字（要輸入空白請用底部 Space）".to_string()
+            }
+            Some(Hit::OvPrev) | Some(Hit::OvNext) | Some(Hit::PagePrev) | Some(Hit::PageNext) => {
+                "九方換頁  ·  最後一頁之後返去第一頁（滾輪一樣）".to_string()
+            }
+            _ => q9_hint(state),
+        };
+    }
     if matches!(state.hover, Some(Hit::Opacity)) {
         return format!(
             "透明度 {}  ·  點擊切換 100% / 50% / 25%",
@@ -2227,7 +3040,7 @@ fn hint_text(state: &AppState) -> String {
     if matches!(state.hover, Some(Hit::Brand) | Some(Hit::Cp437(0))) {
         return topmost_hint(state);
     }
-    match state.mode {
+    match state.ime.mode {
         Mode::Cp437 => {
             if let Some(code) = match state.hover {
                 Some(Hit::Cp437(c)) => Some(c),
@@ -2261,7 +3074,9 @@ fn hint_text(state: &AppState) -> String {
                 "點擊按鍵輸入到先前視窗  ·  唔會搶焦點  ·  拖曳邊緣調整大小".to_string()
             }
         }
-        Mode::Simplex => match state.hover {
+        // Shared keys on the 九方 layout (English, digits, nav, Bksp) reuse
+        // the 速成 wording below.
+        Mode::Simplex | Mode::Jiufang => match state.hover {
             Some(Hit::Letter(ch)) => {
                 let rad = simplex::radical_for(ch).unwrap_or('?');
                 format!(
@@ -2284,7 +3099,9 @@ fn hint_text(state: &AppState) -> String {
                 format!("{}  ·  送到先前視窗", nav.label())
             }
             Some(Hit::Backspace) => {
-                if has_simplex_composition(state) {
+                if state.ime.q9_active() {
+                    "Bksp  ·  取消今次九方取碼".to_string()
+                } else if has_simplex_composition(state) {
                     "Bksp  ·  取消今次速成取碼".to_string()
                 } else {
                     "Bksp  ·  刪除先前視窗一個字元".to_string()
@@ -2311,15 +3128,16 @@ unsafe fn draw_simplex(hdc: HDC, state: &AppState, client: RECT, dirty: RECT) {
     // Codes / mode label in the candidate bar (so 符號 mode is obvious).
     let label = if state.symbols_open {
         "符號".to_string()
-    } else if state.codes.is_empty() {
+    } else if state.ime.codes.is_empty() {
         "碼".to_string()
     } else {
         let rads: String = state
+            .ime
             .codes
             .chars()
             .map(|c| simplex::radical_for(c).unwrap_or(c))
             .collect();
-        format!("{rads}  {}", state.codes.to_ascii_uppercase())
+        format!("{rads}  {}", state.ime.codes.to_ascii_uppercase())
     };
     let _ = SelectObject(hdc, HGDIOBJ(state.fonts.status.0));
     SetTextColor(hdc, rgb(0x8E, 0xC8, 0xFF));
@@ -2338,7 +3156,8 @@ unsafe fn draw_simplex(hdc: HDC, state: &AppState, client: RECT, dirty: RECT) {
         state.current_page_items()
     };
     for (i, slot) in slots.iter().enumerate() {
-        let ch = items.get(i).copied();
+        // In 簡 the slot shows the glyph that will be typed.
+        let ch = items.get(i).copied().map(|c| state.ime.display(c));
         let hit = Hit::Candidate(i as u8);
         let has = ch.is_some();
         let brush = if has && state.pressed == Some(hit) {
@@ -2374,9 +3193,9 @@ unsafe fn draw_simplex(hdc: HDC, state: &AppState, client: RECT, dirty: RECT) {
         }
     }
 
-    let can_prev = !state.symbols_open && simplex::can_page_prev(state.page);
-    let can_next =
-        !state.symbols_open && simplex::can_page_next(state.current_candidates().len(), state.page);
+    let can_prev = !state.symbols_open && simplex::can_page_prev(state.ime.page);
+    let can_next = !state.symbols_open
+        && simplex::can_page_next(state.current_candidates().len(), state.ime.page);
     let narrow = client.right - client.left < dp(430);
     let prev_label = if narrow { "◀" } else { "上" };
     let next_label = if narrow { "▶" } else { "下" };
@@ -2878,4 +3697,240 @@ unsafe fn draw_cp437_key(hdc: HDC, state: &AppState, client: RECT, code: u8) {
             DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
         );
     }
+}
+
+/// Top candidate bar for 九方: same cells as 速成, showing the current page.
+/// The first candidate (what 空格 commits) gets a blue outline. 上頁／下頁
+/// (‹ › when narrow) wrap.
+unsafe fn draw_q9_candidate_bar(hdc: HDC, state: &AppState, client: RECT) {
+    let t = q9::active();
+    let (brand_rc, codes_rc, slots, prev, next) = candidate_parts(client);
+    draw_brand_chip(hdc, state, brand_rc);
+    let c = &state.ime.q9;
+    let label = if c.is_active() {
+        match c.class() {
+            Some(k) => format!("{}  {}", c.code_text(), k.label()),
+            None => c.code_text(),
+        }
+    } else {
+        "九方".to_string()
+    };
+    let _ = SelectObject(hdc, HGDIOBJ(state.fonts.status.0));
+    SetTextColor(hdc, COMPOSE_TEXT);
+    let mut label_wide: Vec<u16> = label.encode_utf16().collect();
+    let mut label_rc = codes_rc;
+    DrawTextW(
+        hdc,
+        &mut label_wide,
+        &mut label_rc,
+        DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+    );
+    let items = c.page_items(t);
+    for (i, slot) in slots.iter().enumerate() {
+        let ch = items.get(i).copied().map(|x| state.ime.display(x));
+        let hit = Hit::Candidate(i as u8);
+        let has = ch.is_some();
+        let brush = if has && state.pressed == Some(hit) {
+            state.brushes.pressed
+        } else if has && state.hover == Some(hit) {
+            state.brushes.hover
+        } else {
+            state.brushes.key
+        };
+        let accent = if i == 0 && has {
+            Accent::Compose
+        } else {
+            Accent::None
+        };
+        draw_key_body(hdc, state, *slot, dp(6), brush, accent);
+        if let Some(ch) = ch {
+            draw_glyph_centered(hdc, state, *slot, ch, rgb(0xF4, 0xF5, 0xF8));
+        }
+    }
+    let pages = c.page_count(t);
+    let narrow = client.right - client.left < dp(430);
+    let (pl, nl) = if narrow {
+        ("‹", "›")
+    } else {
+        ("上頁", "下頁")
+    };
+    draw_page_btn(hdc, state, prev, Hit::PagePrev, pl, pages > 1);
+    draw_page_btn(hdc, state, next, Hit::PageNext, nl, pages > 1);
+}
+
+unsafe fn draw_glyph_centered(hdc: HDC, state: &AppState, rc: RECT, ch: char, color: COLORREF) {
+    let font = pick_cand_font(hdc, &state.fonts, ch);
+    let _ = SelectObject(hdc, HGDIOBJ(font.0));
+    SetTextColor(hdc, color);
+    let mut s: Vec<u16> = utf16_char(ch);
+    let mut tr = RECT {
+        left: rc.left + 1,
+        top: rc.top,
+        right: rc.right - 1,
+        bottom: rc.bottom,
+    };
+    DrawTextW(hdc, &mut s, &mut tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+}
+
+/// One 九方 pad key. The face follows the composition state (feature,
+/// component, or candidate in numpad position); the key number sits in the
+/// top-left corner. Key 0 is wide and reads `0`, `0 確定` or `0 下頁`.
+unsafe fn draw_q9_key(hdc: HDC, state: &AppState, rc: RECT, key: u8) {
+    if rc.right - rc.left < 4 || rc.bottom - rc.top < 4 {
+        return;
+    }
+    let t = q9::active();
+    let hit = Hit::Q9(key);
+    let face = state.ime.q9.face(key, t);
+    let first_candidate = key == 1 && matches!(face, q9::Face::Candidate(_));
+    let brush = if state.pressed == Some(hit) {
+        state.brushes.pressed
+    } else if state.hover == Some(hit) {
+        state.brushes.hover
+    } else if key == 0 {
+        state.brushes.special
+    } else {
+        state.brushes.key
+    };
+    let radius = ((rc.bottom - rc.top).min(rc.right - rc.left) / 6).clamp(dp(2), dp(10));
+    let accent = if key == 0 || first_candidate {
+        Accent::Compose
+    } else {
+        Accent::None
+    };
+    draw_key_body(hdc, state, rc, radius, brush, accent);
+    // Key number, small, top-left.
+    let _ = SelectObject(hdc, HGDIOBJ(state.fonts.letter.0));
+    SetTextColor(hdc, rgb(0x9A, 0xA4, 0xB8));
+    let mut num = utf16_char(char::from(b'0' + key));
+    let mut nr = RECT {
+        left: rc.left + dp(4),
+        top: rc.top + dp(2),
+        right: rc.right - dp(2),
+        bottom: rc.top + dp(16),
+    };
+    if key != 0 {
+        DrawTextW(hdc, &mut num, &mut nr, DT_TOP | DT_SINGLELINE);
+    }
+    match face {
+        q9::Face::Feature(label) | q9::Face::Component(label) => {
+            let ch = label.chars().next().unwrap_or(' ');
+            let color = if matches!(face, q9::Face::Feature(_)) {
+                rgb(0xE8, 0xE4, 0xC8)
+            } else {
+                rgb(0xF4, 0xF5, 0xF8)
+            };
+            draw_glyph_centered(hdc, state, rc, ch, color);
+        }
+        q9::Face::Candidate(ch) => {
+            draw_glyph_centered(hdc, state, rc, state.ime.display(ch), rgb(0xF4, 0xF5, 0xF8));
+        }
+        q9::Face::Empty => {}
+        q9::Face::Zero(word) => {
+            // Always labelled `0` and `確定` (dim until a code needs it);
+            // `0 下頁` once candidates are visible.
+            let label = format!("0  {}", if word.is_empty() { "確定" } else { word });
+            let _ = SelectObject(hdc, HGDIOBJ(state.fonts.named.0));
+            SetTextColor(
+                hdc,
+                if word.is_empty() {
+                    rgb(0x7A, 0x80, 0x8C)
+                } else {
+                    COMPOSE_TEXT
+                },
+            );
+            let mut text: Vec<u16> = label.encode_utf16().collect();
+            let mut tr = rc;
+            DrawTextW(
+                hdc,
+                &mut text,
+                &mut tr,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+            );
+        }
+    }
+}
+
+unsafe fn draw_jiufang(hdc: HDC, state: &AppState, client: RECT, dirty: RECT) {
+    let band = AppState::candidate_band(client);
+    if rects_overlap(band, dirty) {
+        draw_q9_candidate_bar(hdc, state, client);
+    }
+    let vis = |rc: RECT| rects_overlap(rc, dirty);
+    let layout = state.jlayout(client);
+    for (k, rc) in layout.pad.iter().enumerate() {
+        if vis(*rc) {
+            draw_q9_key(hdc, state, *rc, k as u8);
+        }
+    }
+    for (ch, rc) in layout.digits.iter().filter(|(_, rc)| vis(*rc)) {
+        draw_labeled_key(hdc, state, *rc, &ch.to_string(), Hit::Digit(*ch), false);
+    }
+    if vis(layout.backspace) {
+        draw_labeled_key(hdc, state, layout.backspace, "Bksp", Hit::Backspace, true);
+    }
+    for (ch, rc) in layout.puncts.iter().filter(|(_, rc)| vis(*rc)) {
+        draw_labeled_key(hdc, state, *rc, &ch.to_string(), Hit::Punct(*ch), false);
+    }
+    for (nav, rc) in layout.navs.iter().filter(|(_, rc)| vis(*rc)) {
+        draw_labeled_key(hdc, state, *rc, nav.label(), Hit::Nav(*nav), false);
+    }
+    for (ch, rc) in layout.english.iter().filter(|(_, rc)| vis(*rc)) {
+        draw_english_key(hdc, state, *rc, *ch);
+    }
+    for (hit, label, rc) in layout.actions.iter().filter(|(_, _, rc)| vis(*rc)) {
+        draw_action_key(hdc, state, *rc, label, *hit);
+    }
+}
+
+/// The focus-free 九方 overlay over CP437 / 速成: code header, live pad,
+/// 刪碼 / 清除 / 空格 and ‹ ›. It is part of this window, so it can never
+/// take activation.
+unsafe fn draw_overlay(hdc: HDC, state: &AppState, client: RECT) {
+    let ov = overlay_layout(client);
+    let t = q9::active();
+    // Panel body with a blue compose outline so it reads as a temporary layer.
+    draw_key_body(
+        hdc,
+        state,
+        ov.panel,
+        dp(10),
+        state.brushes.status,
+        Accent::Compose,
+    );
+    let c = &state.ime.q9;
+    let mut header = String::from("九方");
+    if c.is_active() {
+        header.push_str("  ");
+        header.push_str(&c.code_text());
+    }
+    if let Some(k) = c.class() {
+        header.push_str("  ·  ");
+        header.push_str(k.label());
+        let n = c.page_count(t);
+        if n > 0 {
+            header.push_str(&format!("  ·  第 {}/{n} 頁", c.page() + 1));
+        } else {
+            header.push_str("  ·  冇候選字");
+        }
+    }
+    let _ = SelectObject(hdc, HGDIOBJ(state.fonts.status.0));
+    SetTextColor(hdc, COMPOSE_TEXT);
+    let mut text: Vec<u16> = header.encode_utf16().collect();
+    let mut hr = ov.header;
+    DrawTextW(
+        hdc,
+        &mut text,
+        &mut hr,
+        DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+    );
+    for (k, rc) in ov.pad.iter().enumerate() {
+        draw_q9_key(hdc, state, *rc, k as u8);
+    }
+    let pages = c.page_count(t);
+    draw_action_key(hdc, state, ov.del, "刪碼", Hit::OvDelete);
+    draw_action_key(hdc, state, ov.clear, "清除", Hit::OvClear);
+    draw_action_key(hdc, state, ov.space, "空格", Hit::OvSpace);
+    draw_page_btn(hdc, state, ov.prev, Hit::OvPrev, "‹", pages > 1);
+    draw_page_btn(hdc, state, ov.next, Hit::OvNext, "›", pages > 1);
 }

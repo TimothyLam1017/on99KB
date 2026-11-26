@@ -32,9 +32,37 @@ const STATE_UNAVAILABLE: i32 = 0x1;
 /// Every hit target drawn right now, in reading order.
 pub(super) fn visible_hits(state: &AppState, client: RECT) -> Vec<Hit> {
     let mut out = Vec::with_capacity(272);
-    if state.mode == Mode::Simplex {
+    if overlay_shown(state) {
+        // The overlay sits on top and is read first.
+        out.extend((0..=9u8).map(Hit::Q9));
+        out.extend([
+            Hit::OvDelete,
+            Hit::OvClear,
+            Hit::OvSpace,
+            Hit::OvPrev,
+            Hit::OvNext,
+        ]);
+    }
+    if state.ime.mode == Mode::Jiufang {
         out.push(Hit::Brand);
-        if !state.symbols_open {
+        let n = state.bar_items().len().min(9);
+        out.extend((0..n as u8).map(Hit::Candidate));
+        out.push(Hit::PagePrev);
+        out.push(Hit::PageNext);
+        for row in q9::PAD_ROWS {
+            out.extend(row.iter().map(|k| Hit::Q9(*k)));
+        }
+        out.push(Hit::Q9(0));
+        let layout = state.jlayout(client);
+        out.extend(layout.digits.iter().map(|(c, _)| Hit::Digit(*c)));
+        out.push(Hit::Backspace);
+        out.extend(layout.puncts.iter().map(|(c, _)| Hit::Punct(*c)));
+        out.extend(layout.navs.iter().map(|(n, _)| Hit::Nav(*n)));
+        out.extend(layout.english.iter().map(|(c, _)| Hit::Latin(*c)));
+        out.extend(layout.actions.iter().map(|(h, _, _)| *h));
+    } else if state.ime.mode == Mode::Simplex {
+        out.push(Hit::Brand);
+        if !state.symbols_open && !overlay_shown(state) {
             let n = state.current_page_items().len().min(9);
             out.extend((0..n as u8).map(Hit::Candidate));
         }
@@ -55,11 +83,24 @@ pub(super) fn visible_hits(state: &AppState, client: RECT) -> Vec<Hit> {
     } else {
         out.extend((0u8..=255).map(Hit::Cp437));
     }
-    out.push(Hit::Mode(Mode::Cp437));
-    out.push(Hit::Mode(Mode::Simplex));
+    out.extend(MODES.iter().map(|(m, _)| Hit::Mode(*m)));
     out.push(Hit::Opacity);
+    out.extend(OUTPUTS.iter().map(|(o, _)| Hit::Output(*o)));
+    out.push(Hit::NumpadToggle);
     out.push(Hit::AsciiSpace);
     out
+}
+
+/// Spoken name for a 九方 pad key in the current state.
+fn q9_key_name(state: &AppState, key: u8) -> String {
+    match state.ime.q9.face(key, q9::active()) {
+        q9::Face::Feature(f) => format!("九方 {key}, feature {f}"),
+        q9::Face::Component(c) => format!("九方 {key}, component {c}"),
+        q9::Face::Candidate(ch) => format!("九方 {key}, candidate {}", state.ime.display(ch)),
+        q9::Face::Empty => format!("九方 {key}, empty"),
+        q9::Face::Zero("") => "九方 0".to_string(),
+        q9::Face::Zero(word) => format!("九方 0, {word}"),
+    }
 }
 
 /// Spoken name for a key. Short, and says what pressing it does.
@@ -75,10 +116,20 @@ pub(super) fn hit_name(state: &AppState, hit: Hit) -> String {
         },
         Hit::Mode(Mode::Cp437) => "CP437 keyboard".to_string(),
         Hit::Mode(Mode::Simplex) => "速成 Simplex keyboard".to_string(),
+        Hit::Mode(Mode::Jiufang) => "九方 shape-input keyboard".to_string(),
+        Hit::Output(OutputScript::Traditional) => "繁, Traditional output".to_string(),
+        Hit::Output(OutputScript::Simplified) => "簡, Simplified output".to_string(),
+        Hit::NumpadToggle => format!("數墊, numpad capture {}", on_off(state.ime.numpad_capture)),
+        Hit::Q9(k) => q9_key_name(state, k),
+        Hit::OvDelete => "刪碼, delete one 九方 code".to_string(),
+        Hit::OvClear => "清除, clear 九方 code".to_string(),
+        Hit::OvSpace => "空格, type first 九方 candidate".to_string(),
+        Hit::OvPrev => "Previous 九方 candidates".to_string(),
+        Hit::OvNext => "Next 九方 candidates".to_string(),
         Hit::Opacity => format!("Opacity {}", state.opacity.label()),
         Hit::AsciiSpace => "Space".to_string(),
-        Hit::Candidate(i) => match state.current_page_items().get(i as usize) {
-            Some(ch) => format!("Candidate {}, {ch}", i + 1),
+        Hit::Candidate(i) => match state.bar_items().get(i as usize) {
+            Some(ch) => format!("Candidate {}, {}", i + 1, state.ime.display(*ch)),
             None => format!("Candidate {}, empty", i + 1),
         },
         Hit::PagePrev => "Previous candidates".to_string(),
@@ -96,7 +147,7 @@ pub(super) fn hit_name(state: &AppState, hit: Hit) -> String {
         Hit::Nav(NavKey::PageUp) => "Page Up".to_string(),
         Hit::Nav(NavKey::PageDown) => "Page Down".to_string(),
         Hit::Backspace => {
-            if has_simplex_composition(state) {
+            if state.ime.q9_active() || has_simplex_composition(state) {
                 "Backspace, cancel codes".to_string()
             } else {
                 "Backspace".to_string()
@@ -118,7 +169,9 @@ fn hit_state_flags(state: &AppState, hit: Hit) -> i32 {
         flags |= STATE_PRESSED;
     }
     let checked = match hit {
-        Hit::Mode(m) => state.mode == m,
+        Hit::Mode(m) => state.ime.mode == m,
+        Hit::Output(o) => state.ime.output == o,
+        Hit::NumpadToggle => state.ime.numpad_capture,
         Hit::Cp437(0) | Hit::Brand => state.topmost,
         Hit::SymbolToggle => state.symbols_open,
         _ => false,
@@ -126,11 +179,14 @@ fn hit_state_flags(state: &AppState, hit: Hit) -> i32 {
     if checked {
         flags |= STATE_SYSTEM_CHECKED as i32;
     }
+    let q9_pages = state.ime.q9.page_count(q9::active());
     let disabled = match hit {
-        Hit::PagePrev => state.symbols_open || !simplex::can_page_prev(state.page),
+        Hit::PagePrev | Hit::PageNext if q9_bar(state) => q9_pages < 2,
+        Hit::OvPrev | Hit::OvNext => q9_pages < 2,
+        Hit::PagePrev => state.symbols_open || !simplex::can_page_prev(state.ime.page),
         Hit::PageNext => {
             state.symbols_open
-                || !simplex::can_page_next(state.current_candidates().len(), state.page)
+                || !simplex::can_page_next(state.current_candidates().len(), state.ime.page)
         }
         _ => false,
     };
@@ -263,9 +319,10 @@ impl IAccessible_Impl for KeyboardAccessible_Impl {
 
     fn get_accName(&self, var: &VARIANT) -> windows::core::Result<BSTR> {
         match self.child(var)? {
-            None => Ok(BSTR::from(match self.state()?.mode {
+            None => Ok(BSTR::from(match self.state()?.ime.mode {
                 Mode::Cp437 => "on99KB CP437 keyboard",
                 Mode::Simplex => "on99KB 速成 keyboard",
+                Mode::Jiufang => "on99KB 九方 keyboard",
             })),
             Some(hit) => Ok(BSTR::from(hit_name(self.state()?, hit))),
         }
@@ -276,8 +333,10 @@ impl IAccessible_Impl for KeyboardAccessible_Impl {
         match self.child(var)? {
             None => {
                 let state = self.state()?;
-                if state.mode == Mode::Simplex && !state.codes.is_empty() {
-                    Ok(BSTR::from(state.codes.to_ascii_uppercase()))
+                if state.ime.q9_live() && state.ime.q9.is_active() {
+                    Ok(BSTR::from(state.ime.q9.code_text()))
+                } else if state.ime.mode == Mode::Simplex && !state.ime.codes.is_empty() {
+                    Ok(BSTR::from(state.ime.codes.to_ascii_uppercase()))
                 } else {
                     Err(Error::from(S_FALSE))
                 }

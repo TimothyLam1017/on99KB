@@ -373,7 +373,12 @@ fn generate_hk2s(manifest: &Path) {
     let norm = load_opencc_chars(&dir.join("CJK_Compatibility_Ideographs.txt"));
     let rev = load_opencc_chars(&dir.join("HKVariantsRev.txt"));
     let ts = load_opencc_chars(&dir.join("TSCharacters.txt"));
-    let mut keys: Vec<char> = norm.keys().chain(rev.keys()).chain(ts.keys()).copied().collect();
+    let mut keys: Vec<char> = norm
+        .keys()
+        .chain(rev.keys())
+        .chain(ts.keys())
+        .copied()
+        .collect();
     keys.sort();
     keys.dedup();
     let mut bin = Vec::new();

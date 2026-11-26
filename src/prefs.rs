@@ -417,16 +417,24 @@ mod tests {
     #[test]
     fn output_round_trips_and_falls_back_to_traditional() {
         for o in [OutputScript::Traditional, OutputScript::Simplified] {
-            let mut p = sanitize(480, 460, None, None, Opacity::P100, true, KeyboardMode::Simplex)
-                .unwrap();
+            let mut p = sanitize(
+                480,
+                460,
+                None,
+                None,
+                Opacity::P100,
+                true,
+                KeyboardMode::Simplex,
+            )
+            .unwrap();
             p.output = o;
             let text = format_window_ini(&p);
             assert!(text.contains(&format!("output={}", o.as_ini())));
             assert_eq!(parse_window_ini(&text).unwrap(), p);
         }
         for bad in ["output=simple\n", "output=\n", "output=1\n", ""] {
-            let p = parse_window_ini(&format!("width=480\nheight=460\nmode=simplex\n{bad}"))
-                .unwrap();
+            let p =
+                parse_window_ini(&format!("width=480\nheight=460\nmode=simplex\n{bad}")).unwrap();
             assert_eq!(p.output, OutputScript::Traditional, "{bad:?}");
             assert_eq!(p.mode, KeyboardMode::Simplex);
             assert_eq!(p.width, 480);
@@ -436,16 +444,32 @@ mod tests {
     #[test]
     fn numpad_capture_round_trips_and_falls_back_to_on() {
         for on in [true, false] {
-            let mut p = sanitize(480, 460, None, None, Opacity::P100, true, KeyboardMode::Cp437)
-                .unwrap();
+            let mut p = sanitize(
+                480,
+                460,
+                None,
+                None,
+                Opacity::P100,
+                true,
+                KeyboardMode::Cp437,
+            )
+            .unwrap();
             p.numpad_capture = on;
             let text = format_window_ini(&p);
-            assert!(text.contains(if on { "numpad_capture=1" } else { "numpad_capture=0" }));
+            assert!(text.contains(if on {
+                "numpad_capture=1"
+            } else {
+                "numpad_capture=0"
+            }));
             assert_eq!(parse_window_ini(&text).unwrap(), p);
         }
-        for bad in ["numpad_capture=2\n", "numpad_capture=yes\n", "numpad_capture=\n", ""] {
-            let p = parse_window_ini(&format!("width=480\nheight=460\ntopmost=0\n{bad}"))
-                .unwrap();
+        for bad in [
+            "numpad_capture=2\n",
+            "numpad_capture=yes\n",
+            "numpad_capture=\n",
+            "",
+        ] {
+            let p = parse_window_ini(&format!("width=480\nheight=460\ntopmost=0\n{bad}")).unwrap();
             assert!(p.numpad_capture, "{bad:?}");
             assert!(!p.topmost);
         }
@@ -457,7 +481,10 @@ mod tests {
             "units=dip\nwidth=600\nheight=520\nopacity=25\ntopmost=0\nmode=simplex\nx=-5\ny=40\n",
         )
         .unwrap();
-        assert_eq!((p.width, p.height, p.x, p.y), (600, 520, Some(-5), Some(40)));
+        assert_eq!(
+            (p.width, p.height, p.x, p.y),
+            (600, 520, Some(-5), Some(40))
+        );
         assert_eq!(p.opacity, Opacity::P25);
         assert!(!p.topmost);
         assert!(p.dip);

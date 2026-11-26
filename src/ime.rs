@@ -312,8 +312,16 @@ mod tests {
         for mode in [KeyboardMode::Cp437, KeyboardMode::Simplex] {
             let mut ime = Ime::new(mode);
             let stored = crate::prefs::format_window_ini(
-                &crate::prefs::sanitize(480, 460, None, None, crate::prefs::Opacity::P100, true, ime.mode)
-                    .unwrap(),
+                &crate::prefs::sanitize(
+                    480,
+                    460,
+                    None,
+                    None,
+                    crate::prefs::Opacity::P100,
+                    true,
+                    ime.mode,
+                )
+                .unwrap(),
             );
             ime.numpad_digit(6, &t);
             assert!(ime.overlay_open, "overlay opens on {mode:?}");
@@ -322,8 +330,16 @@ mod tests {
             ime.numpad_digit(0, &t);
             assert_eq!(ime.mode, mode, "visible layout unchanged");
             let again = crate::prefs::format_window_ini(
-                &crate::prefs::sanitize(480, 460, None, None, crate::prefs::Opacity::P100, true, ime.mode)
-                    .unwrap(),
+                &crate::prefs::sanitize(
+                    480,
+                    460,
+                    None,
+                    None,
+                    crate::prefs::Opacity::P100,
+                    true,
+                    ime.mode,
+                )
+                .unwrap(),
             );
             assert_eq!(stored, again, "mode= unchanged");
             let a = ime.numpad_digit(1, &t);
@@ -425,7 +441,11 @@ mod tests {
 
     #[test]
     fn bksp_without_composition_sends_vk_back() {
-        for mode in [KeyboardMode::Cp437, KeyboardMode::Simplex, KeyboardMode::Jiufang] {
+        for mode in [
+            KeyboardMode::Cp437,
+            KeyboardMode::Simplex,
+            KeyboardMode::Jiufang,
+        ] {
             let mut ime = Ime::new(mode);
             assert_eq!(ime.backspace(), Action::SendBackspace, "{mode:?}");
         }
@@ -487,7 +507,8 @@ mod tests {
             assert_eq!(should_capture(g, vk, 0), None);
         }
         // The stored numpad_capture=0 maps to capture_on = false.
-        let p = crate::prefs::parse_window_ini("width=480\nheight=460\nnumpad_capture=0\n").unwrap();
+        let p =
+            crate::prefs::parse_window_ini("width=480\nheight=460\nnumpad_capture=0\n").unwrap();
         let g = Gate {
             capture_on: p.numpad_capture,
             ..open_gate()

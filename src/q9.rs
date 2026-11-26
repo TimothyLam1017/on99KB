@@ -468,7 +468,10 @@ mod tests {
         let g = golden_row('禁');
         assert_eq!(g.class, Class::Split);
         assert_ne!(g.code[2], 0);
-        assert_eq!(find_by_typing(&builtin(), g.code, '禁').unwrap().0, Class::Split);
+        assert_eq!(
+            find_by_typing(&builtin(), g.code, '禁').unwrap().0,
+            Class::Split
+        );
         // Never filed as a whole character under the same head.
         assert!(!builtin().lookup([1, 2, 0]).contains(&'禁'));
     }
@@ -477,7 +480,10 @@ mod tests {
     fn xiang_is_split() {
         let g = golden_row('響');
         assert_eq!(g.class, Class::Split);
-        assert_eq!(find_by_typing(&builtin(), g.code, '響').unwrap().0, Class::Split);
+        assert_eq!(
+            find_by_typing(&builtin(), g.code, '響').unwrap().0,
+            Class::Split
+        );
         assert!(builtin()
             .codes_for('響')
             .iter()
@@ -488,7 +494,10 @@ mod tests {
     fn jing_is_whole() {
         let g = golden_row('晶');
         assert_eq!(g.class, Class::Whole);
-        assert_eq!(find_by_typing(&builtin(), g.code, '晶').unwrap().0, Class::Whole);
+        assert_eq!(
+            find_by_typing(&builtin(), g.code, '晶').unwrap().0,
+            Class::Whole
+        );
         assert!(builtin()
             .codes_for('晶')
             .iter()
@@ -499,7 +508,10 @@ mod tests {
     fn lei_is_whole() {
         let g = golden_row('壘');
         assert_eq!(g.class, Class::Whole);
-        assert_eq!(find_by_typing(&builtin(), g.code, '壘').unwrap().0, Class::Whole);
+        assert_eq!(
+            find_by_typing(&builtin(), g.code, '壘').unwrap().0,
+            Class::Whole
+        );
     }
 
     #[test]
@@ -517,8 +529,17 @@ mod tests {
         assert_eq!(c.class(), Some(Class::Whole));
         let pos = c.page_items(&t).iter().position(|x| *x == '前').unwrap();
         assert_eq!(c.press(pos as u8 + 1, &t), KeyResult::Commit('前'));
-        for (ch, code) in [('月', [3, 9, 0]), ('光', [8, 5, 0]), ('是', [6, 9, 0]), ('上', [8, 8, 0])] {
-            assert_eq!(find_by_typing(&t, code, ch).map(|f| f.0), Some(Class::Whole), "{ch}");
+        for (ch, code) in [
+            ('月', [3, 9, 0]),
+            ('光', [8, 5, 0]),
+            ('是', [6, 9, 0]),
+            ('上', [8, 8, 0]),
+        ] {
+            assert_eq!(
+                find_by_typing(&t, code, ch).map(|f| f.0),
+                Some(Class::Whole),
+                "{ch}"
+            );
         }
     }
 
@@ -642,7 +663,10 @@ mod tests {
         assert_eq!(user.lookup([6, 9, 0]), &['日', '是', '早']);
         assert_eq!(user.lookup([6, 9, 3]), &['明', '𠀾'], "non-BMP allowed");
         assert_eq!(user.code_count(), 2, "invalid lines skipped");
-        assert!(user.lookup([1, 3, 0]).is_empty(), "override replaces built-in");
+        assert!(
+            user.lookup([1, 3, 0]).is_empty(),
+            "override replaces built-in"
+        );
         // An override with no valid line falls back to the built-in table.
         let fallback = load_table(Some("# nothing\nabc\n"));
         assert_eq!(fallback.code_count(), t.code_count());
@@ -657,7 +681,11 @@ mod tests {
         let top: Vec<Face> = PAD_ROWS[0].iter().map(|k| c.face(*k, &t)).collect();
         assert_eq!(
             top,
-            vec![Face::Feature("撇"), Face::Feature("橫"), Face::Feature("豎")]
+            vec![
+                Face::Feature("撇"),
+                Face::Feature("橫"),
+                Face::Feature("豎")
+            ]
         );
         assert_eq!(c.face(1, &t), Face::Feature("十"));
         assert_eq!(c.face(5, &t), Face::Feature("圓"));
