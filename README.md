@@ -25,6 +25,8 @@ Clicking a key types that character into the **previously focused** window. The 
 - In CP437, each key shows the glyph and the `Alt+n` code when there is room (captions hide when the key is shorter than 30 px, as on the compact default window). Tight truncation of long labels (for example `on...`, `不...`) is expected at that size.
 - Fonts: Segoe UI Symbol for CP437 glyphs, Microsoft JhengHei for Chinese labels, Segoe UI for Latin captions. 速成 candidates use Microsoft JhengHei, then MingLiU_HKSCS, then MingLiU_HKSCS-ExtB, so rare HKSCS / Ext-B glyphs are less likely to tofu.
 - Application icon (from `assets/icon.png`) is embedded in the exe and used for the window.
+- Screen readers: the keyboard window exposes each on-screen key to MSAA / UI Automation clients (Narrator, NVDA, JAWS) with a name such as `♥, Alt+3, U+2665` or `日, code A`, a push-button role, hover / pressed / on-off state, and its location. A screen reader's “click” / default action presses the key just like the mouse.
+- Redraws are incremental: hovering or pressing a key repaints only that key and the status hint, and the 速成 layout is computed once per window size instead of on every mouse move.
 
 ## Run the exe
 
