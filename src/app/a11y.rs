@@ -466,10 +466,8 @@ impl IAccessible_Impl for KeyboardAccessible_Impl {
         };
         let state = self.state()?;
         activate_hit(self.hwnd, state, hit);
-        unsafe {
-            let _ = InvalidateRect(self.hwnd, None, false);
-        }
-        notify_reorder(self.hwnd);
+        // Repaint, announce, and re-sync the hook (Backspace 清碼 state).
+        super::refresh_after_input(self.hwnd, state);
         Ok(())
     }
 
