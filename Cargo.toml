@@ -1,6 +1,6 @@
 [package]
 name = "on99kb"
-version = "1.2.2"
+version = "1.2.3"
 edition = "2021"
 authors = ["Timothy Lam <him1017@gmail.com>"]
 description = "Resizable Windows on-screen keyboard for IBM CP437 and Hong Kong 速成 (Simplex)."
