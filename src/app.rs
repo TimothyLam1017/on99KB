@@ -23,9 +23,10 @@ use windows::Win32::Graphics::Gdi::{
     CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetGlyphIndicesW,
     GetStockObject, InvalidateRect, RoundRect, ScreenToClient, SelectObject, SetBkMode,
     SetTextColor, BLACK_BRUSH, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
-    DEFAULT_PITCH, DT_CENTER, DT_END_ELLIPSIS, DT_SINGLELINE, DT_VCENTER, FF_DONTCARE, FW_NORMAL,
-    FW_SEMIBOLD, GGI_MARK_NONEXISTING_GLYPHS, HBRUSH, HDC, HFONT, HGDIOBJ, HPEN, OUT_TT_PRECIS,
-    PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
+    DEFAULT_PITCH, DT_CENTER, DT_END_ELLIPSIS, DT_NOCLIP, DT_RIGHT, DT_SINGLELINE, DT_TOP,
+    DT_VCENTER, FF_DONTCARE, FW_NORMAL, FW_SEMIBOLD, GGI_MARK_NONEXISTING_GLYPHS, HBRUSH, HDC,
+    HFONT, HGDIOBJ, HPEN, OUT_TT_PRECIS, PAINTSTRUCT, PS_INSIDEFRAME, PS_SOLID, SRCCOPY,
+    TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
@@ -72,7 +73,14 @@ const MODE_SEG_W: i32 = 62;
 const OPACITY_BTN_W: i32 = 50;
 const SPACE_BAR_MIN_W: i32 = 96;
 const SPACE_BAR_MAX_W: i32 = 280;
-const HINT_RESERVE_W: i32 = 88;
+/// Dedicated full-width row above the control bar for the hint text, so it
+/// is never squeezed into the space left beside the Space bar.
+/// This is its minimum height; it grows with the status font.
+const HINT_ROW_MIN_H: i32 = 20;
+/// Below this key height the CP437 caption shrinks to the bare number.
+const CP437_FULL_CAPTION_H: i32 = 30;
+const CP437_COMPACT_CAPTION_H: i32 = 20;
+const CP437_COMPACT_CAPTION_BAND: i32 = 9;
 const ICON_RESOURCE_ID: u16 = 1;
 const AUX_ROW_H: i32 = 28;
 const LETTER_ROW_MIN_H: i32 = 46;
@@ -157,8 +165,8 @@ fn latin_shifted_char(ch: char) -> char {
     }
 }
 
-fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
-    COLORREF(u32::from(r) | (u32::from(g) << 8) | (u32::from(b) << 16))
+const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
+    COLORREF(r as u32 | ((g as u32) << 8) | ((b as u32) << 16))
 }
 
 fn point_from_lparam(lparam: LPARAM) -> (i32, i32) {
@@ -335,6 +343,47 @@ struct Brushes {
     selected: HBRUSH,
     disabled: HBRUSH,
     border: HPEN,
+    /// Outline for controls that act on the window or the target app
+    /// (topmost toggle, Backspace, opacity) rather than typing a character.
+    control_pen: HPEN,
+    /// Outline for keys that act on the 速成 composition (刪碼 / 清除 / 空格 / 符號).
+    compose_pen: HPEN,
+}
+
+/// Which outline a key gets, so controls never read as plain typing keys.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Accent {
+    None,
+    Control,
+    Compose,
+}
+
+const CONTROL_TEXT: COLORREF = rgb(0xF0, 0xC8, 0x78);
+const COMPOSE_TEXT: COLORREF = rgb(0x8E, 0xC8, 0xFF);
+const HOLD_MARK_TEXT: COLORREF = rgb(0x6E, 0x9E, 0x94);
+
+/// Draw a key body; accented keys get a 2px inside outline instead of the
+/// near-invisible default border.
+unsafe fn draw_key_body(
+    hdc: HDC,
+    state: &AppState,
+    rc: RECT,
+    radius: i32,
+    brush: HBRUSH,
+    accent: Accent,
+) {
+    let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
+    let pen = match accent {
+        Accent::None => None,
+        Accent::Control => Some(state.brushes.control_pen),
+        Accent::Compose => Some(state.brushes.compose_pen),
+    };
+    let old_pen = pen.map(|p| SelectObject(hdc, HGDIOBJ(p.0)));
+    let _ = RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
+    if let Some(old) = old_pen {
+        SelectObject(hdc, old);
+    }
+    SelectObject(hdc, old_brush);
 }
 
 struct AppState {
@@ -383,6 +432,8 @@ impl AppState {
                     selected: CreateSolidBrush(rgb(0x1E, 0x6E, 0xBE)),
                     disabled: CreateSolidBrush(rgb(0x1A, 0x1C, 0x22)),
                     border: CreatePen(PS_SOLID, 1, rgb(0x18, 0x1A, 0x20)),
+                    control_pen: CreatePen(PS_INSIDEFRAME, dp(2).max(1), rgb(0xB0, 0x86, 0x3C)),
+                    compose_pen: CreatePen(PS_INSIDEFRAME, dp(2).max(1), rgb(0x3E, 0x6E, 0xA8)),
                 },
                 font_key: (0, 0, 0, 255),
             })
@@ -398,6 +449,17 @@ impl AppState {
 
     fn status_h(client_h: i32) -> i32 {
         (client_h / 18).clamp(dp(28), dp(44))
+    }
+
+    /// Height of the whole footer: hint row plus control bar.
+    fn footer_h(client_h: i32) -> i32 {
+        Self::status_h(client_h) + Self::hint_row_h(client_h)
+    }
+
+    /// Tall enough for the status font (about 0.48 × status height).
+    fn hint_row_h(client_h: i32) -> i32 {
+        let status = Self::status_h(client_h) as f32;
+        ((status * 0.62).round() as i32).clamp(dp(HINT_ROW_MIN_H), dp(28))
     }
 
     fn status_rect(client: RECT) -> RECT {
@@ -450,10 +512,8 @@ impl AppState {
         let y0 = status.top + dp(3);
         let y1 = status.bottom - dp(3);
         let x0 = Self::opacity_rect(client).right + dp(8);
-        let hint_and_margin = dp(12 + HINT_RESERVE_W + 8);
-        let (min_w, max_w) = (dp(SPACE_BAR_MIN_W), dp(SPACE_BAR_MAX_W));
-        let avail = (status.right - hint_and_margin - x0).max(min_w);
-        let space_w = avail.clamp(min_w, max_w);
+        let avail = (status.right - dp(8) - x0).max(dp(SPACE_BAR_MIN_W));
+        let space_w = avail.clamp(dp(SPACE_BAR_MIN_W), dp(SPACE_BAR_MAX_W));
         RECT {
             left: x0,
             top: y0,
@@ -462,19 +522,29 @@ impl AppState {
         }
     }
 
+    /// Full-width hint row sitting directly above the control bar.
     fn hint_rect(client: RECT) -> RECT {
         let status = Self::status_rect(client);
-        let space = Self::space_bar_rect(client);
         RECT {
-            left: space.right + dp(8),
-            top: status.top,
-            right: status.right - dp(12),
-            bottom: status.bottom,
+            left: dp(12),
+            top: status.top - Self::hint_row_h(client.bottom - client.top),
+            right: (client.right - dp(12)).max(dp(12)),
+            bottom: status.top,
+        }
+    }
+
+    fn footer_rect(client: RECT) -> RECT {
+        let status = Self::status_rect(client);
+        RECT {
+            left: 0,
+            top: status.top - Self::hint_row_h(client.bottom - client.top),
+            right: client.right,
+            bottom: client.bottom,
         }
     }
 
     fn grid_rect(client: RECT) -> RECT {
-        let status = Self::status_h(client.bottom - client.top);
+        let status = Self::footer_h(client.bottom - client.top);
         let pad = dp(GRID_PAD);
         RECT {
             left: pad,
@@ -604,6 +674,7 @@ fn simplex_min_client_h() -> i32 {
         + gap
         + dp(ACTION_ROW_H)
         + dp(2)
+        + dp(HINT_ROW_MIN_H)
         + dp(28);
     needed.max(dp(prefs::MIN_CLIENT_H))
 }
@@ -628,7 +699,7 @@ fn action_rects(row: RECT) -> Vec<(Hit, &'static str, RECT)> {
     let action_w = ((usable - 3 * dp(KEY_GAP)) / 4).clamp(dp(40), dp(72));
     let recs = centered_keys(row, 4, action_w);
     vec![
-        (Hit::Delete, "刪", recs[0]),
+        (Hit::Delete, "刪碼", recs[0]),
         (Hit::Clear, "清除", recs[1]),
         (Hit::Space, "空格", recs[2]),
         (Hit::SymbolToggle, "符號", recs[3]),
@@ -705,7 +776,7 @@ fn simplex_layout(client: RECT, symbols_open: bool) -> SimplexLayout {
         navs.push((nav, rc));
     }
 
-    let status = AppState::status_h(client.bottom - client.top);
+    let status = AppState::footer_h(client.bottom - client.top);
     let action_bottom = client.bottom - status - dp(2);
     let action_top = action_bottom - dp(ACTION_ROW_H);
     let action_row = RECT {
@@ -1013,6 +1084,8 @@ impl Drop for AppState {
                 HGDIOBJ(self.brushes.selected.0),
                 HGDIOBJ(self.brushes.disabled.0),
                 HGDIOBJ(self.brushes.border.0),
+                HGDIOBJ(self.brushes.control_pen.0),
+                HGDIOBJ(self.brushes.compose_pen.0),
             ];
             for obj in objs {
                 if handle_nonzero(obj) {
@@ -1149,9 +1222,9 @@ fn apply_topmost(hwnd: HWND, topmost: bool) {
 
 fn topmost_hint(state: &AppState) -> String {
     if state.topmost {
-        "置頂  ·  開  ·  點擊取消置頂（唔會輸入）".to_string()
+        "置頂：開  ·  點擊取消置頂".to_string()
     } else {
-        "置頂  ·  關  ·  點擊重新置頂（唔會輸入）".to_string()
+        "置頂：關  ·  點擊重新置頂".to_string()
     }
 }
 
@@ -1805,8 +1878,8 @@ unsafe fn paint(hwnd: HWND) {
         state.ensure_fonts(rc);
         FillRect(mem, &rc, state.brushes.bg);
 
-        let status_rc = AppState::status_rect(rc);
-        FillRect(mem, &status_rc, state.brushes.status);
+        let footer_rc = AppState::footer_rect(rc);
+        FillRect(mem, &footer_rc, state.brushes.status);
 
         let old_pen = SelectObject(mem, HGDIOBJ(state.brushes.border.0));
         let _ = SetBkMode(mem, TRANSPARENT);
@@ -1887,11 +1960,9 @@ unsafe fn draw_opacity_btn(hdc: HDC, state: &AppState, client: RECT) {
     } else {
         state.brushes.special
     };
-    let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
-    let _ = RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, dp(6), dp(6));
-    SelectObject(hdc, old_brush);
+    draw_key_body(hdc, state, rc, dp(6), brush, Accent::Control);
     let _ = SelectObject(hdc, HGDIOBJ(state.fonts.status.0));
-    SetTextColor(hdc, rgb(0xF4, 0xF5, 0xF8));
+    SetTextColor(hdc, CONTROL_TEXT);
     let mut text: Vec<u16> = state.opacity.label().encode_utf16().collect();
     let mut text_rc = RECT {
         left: rc.left + 1,
@@ -1957,12 +2028,12 @@ unsafe fn draw_hint(hdc: HDC, state: &AppState, client: RECT) {
 fn hint_text(state: &AppState) -> String {
     if matches!(state.hover, Some(Hit::Opacity)) {
         return format!(
-            "透明度  ·  {}  ·  點擊切換 100% / 50% / 25%（100% 為完全不透明）",
+            "透明度 {}  ·  點擊切換 100% / 50% / 25%",
             state.opacity.label()
         );
     }
     if matches!(state.hover, Some(Hit::AsciiSpace)) {
-        return "空白  ·  Space  ·  輸入空格（U+0020）到先前聚焦視窗".to_string();
+        return "Space  ·  輸入空格到先前視窗".to_string();
     }
     if matches!(state.hover, Some(Hit::Brand) | Some(Hit::Cp437(0))) {
         return topmost_hint(state);
@@ -1977,7 +2048,7 @@ fn hint_text(state: &AppState) -> String {
                     return topmost_hint(state);
                 }
                 if code == 32 {
-                    let text = "BS  ·  Backspace  ·  刪除先前聚焦視窗嘅一個字元";
+                    let text = "BS  ·  Backspace  ·  刪除先前視窗一個字元";
                     if state.last_typed_cp437 == Some(32)
                         && !matches!(state.hover, Some(Hit::Cp437(_)))
                     {
@@ -1998,7 +2069,7 @@ fn hint_text(state: &AppState) -> String {
                     text
                 }
             } else {
-                "置頂 · 唔會搶焦點 · 點擊按鍵輸入到先前聚焦嘅視窗 · 拖曳邊緣可調整大小".to_string()
+                "點擊按鍵輸入到先前視窗  ·  唔會搶焦點  ·  拖曳邊緣調整大小".to_string()
             }
         }
         Mode::Simplex => match state.hover {
@@ -2012,35 +2083,35 @@ fn hint_text(state: &AppState) -> String {
             Some(Hit::Latin(ch)) => {
                 let shifted = latin_shifted_char(ch);
                 if ch == ',' || ch == '.' {
-                    format!(
-                        "英文  ·  {ch}  ·  短按 {ch}、按住 {LATIN_HOLD_MS}ms 出 {shifted}（唔係速成碼）"
-                    )
+                    format!("英文 {ch}  ·  短按 {ch}，按住出 {shifted}")
                 } else {
-                    format!("英文  ·  {ch}  ·  短按小寫、按住 {LATIN_HOLD_MS}ms 大寫（唔係速成碼）")
+                    format!("英文 {ch}  ·  短按小寫，按住大寫")
                 }
             }
             Some(Hit::Digit(ch)) | Some(Hit::Punct(ch)) => {
-                format!("點擊輸入  ·  {ch}  到先前聚焦視窗")
+                format!("{ch}  ·  點擊輸入到先前視窗")
             }
             Some(Hit::Nav(nav)) => {
-                format!("{}  ·  送到先前聚焦視窗", nav.label())
+                format!("{}  ·  送到先前視窗", nav.label())
             }
             Some(Hit::Backspace) => {
                 if has_simplex_composition(state) {
-                    "Bksp  ·  取消今次速成取碼（唔會送到目標視窗）".to_string()
+                    "Bksp  ·  取消今次速成取碼".to_string()
                 } else {
-                    "Bksp  ·  Backspace  ·  刪除先前聚焦視窗嘅一個字元（唔改速成編碼）".to_string()
+                    "Bksp  ·  刪除先前視窗一個字元".to_string()
                 }
             }
-            Some(Hit::Delete) => "刪  ·  刪除一個速成碼".to_string(),
+            Some(Hit::Delete) => "刪碼  ·  刪除最後一個速成碼（唔會送到目標視窗）".to_string(),
+            Some(Hit::Clear) => "清除  ·  清除全部速成碼（唔會送到目標視窗）".to_string(),
+            Some(Hit::Space) => "空格  ·  上第一個候選字（要輸入空白請用底部 Space）".to_string(),
+            Some(Hit::SymbolToggle) => "符號  ·  切換符號鍵盤／速成字根".to_string(),
             _ if state.symbols_open => {
-                "符號 · 對齊微軟倉頡／速成 Ctrl+Alt+, 符號鍵盤 · 點符號輸入到先前聚焦視窗"
-                    .to_string()
+                "符號  ·  同 Ctrl+Alt+, 符號鍵盤一樣  ·  點擊輸入".to_string()
             }
             _ if state.last_typed.is_some() => {
                 format!("已輸入  ·  {}", state.last_typed.unwrap())
             }
-            _ => "速成 · 最多兩碼（首尾）· 點候選或空格上字到先前聚焦視窗".to_string(),
+            _ => "速成  ·  最多兩碼（首尾）  ·  點候選或 Space 上字".to_string(),
         },
     }
 }
@@ -2171,12 +2242,22 @@ unsafe fn draw_labeled_key(
     } else {
         state.brushes.key
     };
-    let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
     let radius = ((rc.bottom - rc.top).min(rc.right - rc.left) / 6).clamp(dp(2), dp(8));
-    let _ = RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
-    SelectObject(hdc, old_brush);
+    let accent = if special {
+        Accent::Control
+    } else {
+        Accent::None
+    };
+    draw_key_body(hdc, state, rc, radius, brush, accent);
     let _ = SelectObject(hdc, HGDIOBJ(state.fonts.status.0));
-    SetTextColor(hdc, rgb(0xF4, 0xF5, 0xF8));
+    SetTextColor(
+        hdc,
+        if special {
+            CONTROL_TEXT
+        } else {
+            rgb(0xF4, 0xF5, 0xF8)
+        },
+    );
     let mut text: Vec<u16> = label.encode_utf16().collect();
     let mut tr = RECT {
         left: rc.left + 1,
@@ -2245,10 +2326,8 @@ unsafe fn draw_brand_chip(hdc: HDC, state: &AppState, rc: RECT) {
     } else {
         state.brushes.disabled
     };
-    let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
     let radius = ((rc.bottom - rc.top).min(rc.right - rc.left) / 6).clamp(dp(2), dp(8));
-    let _ = RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
-    SelectObject(hdc, old_brush);
+    draw_key_body(hdc, state, rc, radius, brush, Accent::Control);
     let _ = SelectObject(hdc, HGDIOBJ(state.fonts.named.0));
     SetTextColor(
         hdc,
@@ -2317,6 +2396,22 @@ unsafe fn draw_english_key(hdc: HDC, state: &AppState, rc: RECT, letter: char) {
         &mut tr,
         DT_CENTER | DT_VCENTER | DT_SINGLELINE,
     );
+    // Keycap-style corner mark: shows what a long press types, so
+    // hold-for-capitals is discoverable without reading the status bar.
+    let w = rc.right - rc.left;
+    let h = rc.bottom - rc.top;
+    if !shifted && w >= dp(24) && h >= dp(20) {
+        let _ = SelectObject(hdc, HGDIOBJ(state.fonts.letter.0));
+        SetTextColor(hdc, HOLD_MARK_TEXT);
+        let mut mark = utf16_char(latin_shifted_char(letter));
+        let mut mr = RECT {
+            left: rc.left + w / 2,
+            top: rc.top + 1,
+            right: rc.right - 3,
+            bottom: rc.top + h / 2,
+        };
+        DrawTextW(hdc, &mut mark, &mut mr, DT_RIGHT | DT_TOP | DT_SINGLELINE);
+    }
 }
 
 unsafe fn draw_letter_key(hdc: HDC, state: &AppState, rc: RECT, letter: char) {
@@ -2445,12 +2540,10 @@ unsafe fn draw_action_key(hdc: HDC, state: &AppState, rc: RECT, label: &str, hit
     } else {
         state.brushes.special
     };
-    let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
     let radius = ((rc.bottom - rc.top).min(rc.right - rc.left) / 6).clamp(dp(2), dp(10));
-    let _ = RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
-    SelectObject(hdc, old_brush);
+    draw_key_body(hdc, state, rc, radius, brush, Accent::Compose);
     let _ = SelectObject(hdc, HGDIOBJ(state.fonts.named.0));
-    SetTextColor(hdc, rgb(0xE8, 0xE4, 0xC8));
+    SetTextColor(hdc, COMPOSE_TEXT);
     let mut text: Vec<u16> = label.encode_utf16().collect();
     let mut tr = RECT {
         left: rc.left + 2,
@@ -2489,13 +2582,21 @@ unsafe fn draw_cp437_key(hdc: HDC, state: &AppState, client: RECT, code: u8) {
         state.brushes.key
     };
 
-    let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
     let radius = ((rc.bottom - rc.top).min(rc.right - rc.left) / 6).clamp(dp(2), dp(10));
-    let _ = RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
-    SelectObject(hdc, old_brush);
+    // Cells 0 (topmost toggle) and 32 (Backspace) are controls, not glyphs.
+    let accent = if code == 0 || code == 32 {
+        Accent::Control
+    } else {
+        Accent::None
+    };
+    draw_key_body(hdc, state, rc, radius, brush, accent);
 
     let h = rc.bottom - rc.top;
-    let show_caption = h >= dp(30) && code != 0 && code != 32;
+    // Full "Alt+n" caption on big keys; at the default window size keys are
+    // only ~22 px tall, so fall back to the bare number in a thin band.
+    let has_caption = code != 0 && code != 32;
+    let full_caption = has_caption && h >= dp(CP437_FULL_CAPTION_H);
+    let show_caption = has_caption && h >= dp(CP437_COMPACT_CAPTION_H);
     let named = code == 0 || code == 32 || cp437::is_named_blank(code);
     let label = if code == 32 {
         "BS".to_string()
@@ -2514,6 +2615,8 @@ unsafe fn draw_cp437_key(hdc: HDC, state: &AppState, client: RECT, code: u8) {
                 } else {
                     rgb(0x7A, 0x80, 0x8C)
                 }
+            } else if code == 32 {
+                CONTROL_TEXT
             } else {
                 rgb(0xE8, 0xE4, 0xC8)
             },
@@ -2528,23 +2631,37 @@ unsafe fn draw_cp437_key(hdc: HDC, state: &AppState, client: RECT, code: u8) {
             left: rc.left + 2,
             top: rc.top + 2,
             right: rc.right - 2,
-            bottom: rc.bottom - (h / 3).max(dp(12)),
+            bottom: if full_caption {
+                rc.bottom - (h / 3).max(dp(12))
+            } else {
+                rc.bottom - dp(CP437_COMPACT_CAPTION_BAND)
+            },
         };
-        DrawTextW(
-            hdc,
-            &mut label_wide,
-            &mut glyph_rc,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
-        );
+        // The compact band leaves the glyph a little less room than its font
+        // height, so let it overflow slightly instead of being clipped.
+        let glyph_flags = if full_caption {
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS
+        } else {
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOCLIP
+        };
+        DrawTextW(hdc, &mut label_wide, &mut glyph_rc, glyph_flags);
 
-        let cap = format!("Alt+{code}");
+        let cap = if full_caption {
+            format!("Alt+{code}")
+        } else {
+            code.to_string()
+        };
         let mut cap_wide: Vec<u16> = cap.encode_utf16().collect();
         let _ = SelectObject(hdc, HGDIOBJ(state.fonts.caption.0));
         SetTextColor(hdc, rgb(0x9A, 0xA4, 0xB8));
         let mut cap_rc = RECT {
-            left: rc.left + 2,
-            top: glyph_rc.bottom - 1,
-            right: rc.right - 2,
+            left: rc.left + 1,
+            top: if full_caption {
+                glyph_rc.bottom - 1
+            } else {
+                rc.bottom - dp(CP437_COMPACT_CAPTION_BAND) - 1
+            },
+            right: rc.right - 1,
             bottom: rc.bottom - 1,
         };
         DrawTextW(
