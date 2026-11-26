@@ -202,8 +202,8 @@ fn rects_overlap(a: RECT, b: RECT) -> bool {
     a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
 }
 
-/// Repaint just the keys whose hover/pressed look changed, plus the status
-/// hint (its text follows hover). Falls back to a full repaint if a key's
+/// Repaint just the keys whose hover/pressed look changed, plus the hint
+/// row above the control bar (its text follows hover). Falls back to a full repaint if a key's
 /// rect is unknown.
 fn invalidate_hits(hwnd: HWND, state: &AppState, hits: &[Option<Hit>]) {
     let client = client_rect(hwnd);
@@ -211,12 +211,14 @@ fn invalidate_hits(hwnd: HWND, state: &AppState, hits: &[Option<Hit>]) {
         for hit in hits.iter().flatten() {
             match state.hit_rect(client, *hit) {
                 Some(rc) => {
-                    // Rounded-rect outlines sit on the edge; pad by 1 px.
+                    // Rounded-rect outlines sit on the edge; pad a little,
+                    // scaled so 150% / 200% outlines are covered too.
+                    let pad = dp(2).max(1);
                     let rc = RECT {
-                        left: rc.left - 1,
-                        top: rc.top - 1,
-                        right: rc.right + 1,
-                        bottom: rc.bottom + 1,
+                        left: rc.left - pad,
+                        top: rc.top - pad,
+                        right: rc.right + pad,
+                        bottom: rc.bottom + pad,
                     };
                     let _ = InvalidateRect(hwnd, Some(&rc), false);
                 }
@@ -440,15 +442,16 @@ struct AppState {
     fonts: Fonts,
     brushes: Brushes,
     font_key: (i32, i32, i32, u8),
-    /// 速成 layout for the last (width, height, symbols_open). Rebuilt only
-    /// when one of those changes, so hover / hit-test / paint don't allocate.
+    /// 速成 layout for the last (width, height, DPI, symbols_open). Rebuilt
+    /// only when one of those changes, so hover / hit-test / paint don't allocate.
     simplex_cache: RefCell<Option<(LayoutKey, Rc<SimplexLayout>)>>,
     /// Off-screen buffer kept across paints so only dirty rects are redrawn.
     backbuf: Option<BackBuffer>,
 }
 
-/// (client width, client height, symbols_open).
-type LayoutKey = (i32, i32, bool);
+/// (client width, client height, window DPI, symbols_open). DPI is part of
+/// the key because every row height and gap is scaled with `dp`.
+type LayoutKey = (i32, i32, u32, bool);
 
 /// Persistent memory DC + bitmap for double buffering. Recreated on resize.
 struct BackBuffer {
@@ -962,6 +965,7 @@ impl AppState {
         let key = (
             client.right - client.left,
             client.bottom - client.top,
+            current_dpi(),
             self.symbols_open,
         );
         let mut cache = self.simplex_cache.borrow_mut();
@@ -1723,6 +1727,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 state.invalidate_layout();
             }
             let _ = InvalidateRect(hwnd, None, false);
+            a11y::notify_reorder(hwnd);
             LRESULT(0)
         }
         WM_MOVE => {
@@ -2053,9 +2058,6 @@ unsafe fn paint(hwnd: HWND) {
 
     let footer_rc = AppState::footer_rect(rc);
     FillRect(mem, &footer_rc, state.brushes.status);
-
-    let status_rc = AppState::status_rect(rc);
-    FillRect(mem, &status_rc, state.brushes.status);
 
     let old_pen = SelectObject(mem, HGDIOBJ(state.brushes.border.0));
     // The back buffer outlives this paint, so put its original font back at
