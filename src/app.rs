@@ -22,9 +22,10 @@ use windows::Win32::Graphics::Gdi::{
     CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetGlyphIndicesW,
     GetStockObject, InvalidateRect, RoundRect, ScreenToClient, SelectObject, SetBkMode,
     SetTextColor, BLACK_BRUSH, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
-    DEFAULT_PITCH, DT_CENTER, DT_END_ELLIPSIS, DT_RIGHT, DT_SINGLELINE, DT_TOP, DT_VCENTER,
-    FF_DONTCARE, FW_NORMAL, FW_SEMIBOLD, GGI_MARK_NONEXISTING_GLYPHS, HBRUSH, HDC, HFONT, HGDIOBJ,
-    HPEN, OUT_TT_PRECIS, PAINTSTRUCT, PS_INSIDEFRAME, PS_SOLID, SRCCOPY, TRANSPARENT,
+    DEFAULT_PITCH, DT_CENTER, DT_END_ELLIPSIS, DT_NOCLIP, DT_RIGHT, DT_SINGLELINE, DT_TOP,
+    DT_VCENTER, FF_DONTCARE, FW_NORMAL, FW_SEMIBOLD, GGI_MARK_NONEXISTING_GLYPHS, HBRUSH, HDC,
+    HFONT, HGDIOBJ, HPEN, OUT_TT_PRECIS, PAINTSTRUCT, PS_INSIDEFRAME, PS_SOLID, SRCCOPY,
+    TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
@@ -70,7 +71,14 @@ const MODE_SEG_W: i32 = 62;
 const OPACITY_BTN_W: i32 = 50;
 const SPACE_BAR_MIN_W: i32 = 96;
 const SPACE_BAR_MAX_W: i32 = 280;
-const HINT_RESERVE_W: i32 = 88;
+/// Dedicated full-width row above the control bar for the hint text, so it
+/// is never squeezed into the space left beside the Space bar.
+/// This is its minimum height; it grows with the status font.
+const HINT_ROW_MIN_H: i32 = 20;
+/// Below this key height the CP437 caption shrinks to the bare number.
+const CP437_FULL_CAPTION_H: i32 = 30;
+const CP437_COMPACT_CAPTION_H: i32 = 20;
+const CP437_COMPACT_CAPTION_BAND: i32 = 9;
 const ICON_RESOURCE_ID: u16 = 1;
 const AUX_ROW_H: i32 = 28;
 const LETTER_ROW_MIN_H: i32 = 46;
@@ -397,6 +405,17 @@ impl AppState {
         (client_h / 18).clamp(28, 44)
     }
 
+    /// Height of the whole footer: hint row plus control bar.
+    fn footer_h(client_h: i32) -> i32 {
+        Self::status_h(client_h) + Self::hint_row_h(client_h)
+    }
+
+    /// Tall enough for the status font (about 0.48 × status height).
+    fn hint_row_h(client_h: i32) -> i32 {
+        let status = Self::status_h(client_h) as f32;
+        ((status * 0.62).round() as i32).clamp(HINT_ROW_MIN_H, 28)
+    }
+
     fn status_rect(client: RECT) -> RECT {
         let status = Self::status_h(client.bottom - client.top);
         RECT {
@@ -446,8 +465,7 @@ impl AppState {
         let y0 = status.top + 3;
         let y1 = status.bottom - 3;
         let x0 = Self::opacity_rect(client).right + 8;
-        let hint_and_margin = 12 + HINT_RESERVE_W + 8;
-        let avail = (status.right - hint_and_margin - x0).max(SPACE_BAR_MIN_W);
+        let avail = (status.right - 8 - x0).max(SPACE_BAR_MIN_W);
         let space_w = avail.clamp(SPACE_BAR_MIN_W, SPACE_BAR_MAX_W);
         RECT {
             left: x0,
@@ -457,19 +475,29 @@ impl AppState {
         }
     }
 
+    /// Full-width hint row sitting directly above the control bar.
     fn hint_rect(client: RECT) -> RECT {
         let status = Self::status_rect(client);
-        let space = Self::space_bar_rect(client);
         RECT {
-            left: space.right + 8,
-            top: status.top,
-            right: status.right - 12,
-            bottom: status.bottom,
+            left: 12,
+            top: status.top - Self::hint_row_h(client.bottom - client.top),
+            right: (client.right - 12).max(12),
+            bottom: status.top,
+        }
+    }
+
+    fn footer_rect(client: RECT) -> RECT {
+        let status = Self::status_rect(client);
+        RECT {
+            left: 0,
+            top: status.top - Self::hint_row_h(client.bottom - client.top),
+            right: client.right,
+            bottom: client.bottom,
         }
     }
 
     fn grid_rect(client: RECT) -> RECT {
-        let status = Self::status_h(client.bottom - client.top);
+        let status = Self::footer_h(client.bottom - client.top);
         RECT {
             left: GRID_PAD,
             top: GRID_PAD,
@@ -593,6 +621,7 @@ fn simplex_min_client_h() -> i32 {
         + SIMPLEX_GAP
         + ACTION_ROW_H
         + 2
+        + HINT_ROW_MIN_H
         + 28;
     needed.max(prefs::MIN_CLIENT_H)
 }
@@ -689,7 +718,7 @@ fn simplex_layout(client: RECT, symbols_open: bool) -> SimplexLayout {
         navs.push((nav, rc));
     }
 
-    let status = AppState::status_h(client.bottom - client.top);
+    let status = AppState::footer_h(client.bottom - client.top);
     let action_bottom = client.bottom - status - 2;
     let action_top = action_bottom - ACTION_ROW_H;
     let action_row = RECT {
@@ -1129,9 +1158,9 @@ fn apply_topmost(hwnd: HWND, topmost: bool) {
 
 fn topmost_hint(state: &AppState) -> String {
     if state.topmost {
-        "置頂  ·  開  ·  點擊取消置頂（唔會輸入）".to_string()
+        "置頂：開  ·  點擊取消置頂".to_string()
     } else {
-        "置頂  ·  關  ·  點擊重新置頂（唔會輸入）".to_string()
+        "置頂：關  ·  點擊重新置頂".to_string()
     }
 }
 
@@ -1796,8 +1825,8 @@ unsafe fn paint(hwnd: HWND) {
         state.ensure_fonts(rc);
         FillRect(mem, &rc, state.brushes.bg);
 
-        let status_rc = AppState::status_rect(rc);
-        FillRect(mem, &status_rc, state.brushes.status);
+        let footer_rc = AppState::footer_rect(rc);
+        FillRect(mem, &footer_rc, state.brushes.status);
 
         let old_pen = SelectObject(mem, HGDIOBJ(state.brushes.border.0));
         let _ = SetBkMode(mem, TRANSPARENT);
@@ -1946,12 +1975,12 @@ unsafe fn draw_hint(hdc: HDC, state: &AppState, client: RECT) {
 fn hint_text(state: &AppState) -> String {
     if matches!(state.hover, Some(Hit::Opacity)) {
         return format!(
-            "透明度  ·  {}  ·  點擊切換 100% / 50% / 25%（100% 為完全不透明）",
+            "透明度 {}  ·  點擊切換 100% / 50% / 25%",
             state.opacity.label()
         );
     }
     if matches!(state.hover, Some(Hit::AsciiSpace)) {
-        return "空白  ·  Space  ·  輸入空格（U+0020）到先前聚焦視窗".to_string();
+        return "Space  ·  輸入空格到先前視窗".to_string();
     }
     if matches!(state.hover, Some(Hit::Brand) | Some(Hit::Cp437(0))) {
         return topmost_hint(state);
@@ -1966,7 +1995,7 @@ fn hint_text(state: &AppState) -> String {
                     return topmost_hint(state);
                 }
                 if code == 32 {
-                    let text = "BS  ·  Backspace  ·  刪除先前聚焦視窗嘅一個字元";
+                    let text = "BS  ·  Backspace  ·  刪除先前視窗一個字元";
                     if state.last_typed_cp437 == Some(32)
                         && !matches!(state.hover, Some(Hit::Cp437(_)))
                     {
@@ -1987,7 +2016,7 @@ fn hint_text(state: &AppState) -> String {
                     text
                 }
             } else {
-                "置頂 · 唔會搶焦點 · 點擊按鍵輸入到先前聚焦嘅視窗 · 拖曳邊緣可調整大小".to_string()
+                "點擊按鍵輸入到先前視窗  ·  唔會搶焦點  ·  拖曳邊緣調整大小".to_string()
             }
         }
         Mode::Simplex => match state.hover {
@@ -2001,24 +2030,22 @@ fn hint_text(state: &AppState) -> String {
             Some(Hit::Latin(ch)) => {
                 let shifted = latin_shifted_char(ch);
                 if ch == ',' || ch == '.' {
-                    format!(
-                        "英文  ·  {ch}  ·  短按 {ch}、按住 {LATIN_HOLD_MS}ms 出 {shifted}（唔係速成碼）"
-                    )
+                    format!("英文 {ch}  ·  短按 {ch}，按住出 {shifted}")
                 } else {
-                    format!("英文  ·  {ch}  ·  短按小寫、按住 {LATIN_HOLD_MS}ms 大寫（唔係速成碼）")
+                    format!("英文 {ch}  ·  短按小寫，按住大寫")
                 }
             }
             Some(Hit::Digit(ch)) | Some(Hit::Punct(ch)) => {
-                format!("點擊輸入  ·  {ch}  到先前聚焦視窗")
+                format!("{ch}  ·  點擊輸入到先前視窗")
             }
             Some(Hit::Nav(nav)) => {
-                format!("{}  ·  送到先前聚焦視窗", nav.label())
+                format!("{}  ·  送到先前視窗", nav.label())
             }
             Some(Hit::Backspace) => {
                 if has_simplex_composition(state) {
-                    "Bksp  ·  取消今次速成取碼（唔會送到目標視窗）".to_string()
+                    "Bksp  ·  取消今次速成取碼".to_string()
                 } else {
-                    "Bksp  ·  Backspace  ·  刪除先前聚焦視窗嘅一個字元（唔改速成編碼）".to_string()
+                    "Bksp  ·  刪除先前視窗一個字元".to_string()
                 }
             }
             Some(Hit::Delete) => "刪碼  ·  刪除最後一個速成碼（唔會送到目標視窗）".to_string(),
@@ -2026,13 +2053,12 @@ fn hint_text(state: &AppState) -> String {
             Some(Hit::Space) => "空格  ·  上第一個候選字（要輸入空白請用底部 Space）".to_string(),
             Some(Hit::SymbolToggle) => "符號  ·  切換符號鍵盤／速成字根".to_string(),
             _ if state.symbols_open => {
-                "符號 · 對齊微軟倉頡／速成 Ctrl+Alt+, 符號鍵盤 · 點符號輸入到先前聚焦視窗"
-                    .to_string()
+                "符號  ·  同 Ctrl+Alt+, 符號鍵盤一樣  ·  點擊輸入".to_string()
             }
             _ if state.last_typed.is_some() => {
                 format!("已輸入  ·  {}", state.last_typed.unwrap())
             }
-            _ => "速成 · 最多兩碼（首尾）· 點候選或空格上字到先前聚焦視窗".to_string(),
+            _ => "速成  ·  最多兩碼（首尾）  ·  點候選或 Space 上字".to_string(),
         },
     }
 }
@@ -2505,7 +2531,11 @@ unsafe fn draw_cp437_key(hdc: HDC, state: &AppState, client: RECT, code: u8) {
     draw_key_body(hdc, state, rc, radius, brush, accent);
 
     let h = rc.bottom - rc.top;
-    let show_caption = h >= 30 && code != 0 && code != 32;
+    // Full "Alt+n" caption on big keys; at the default window size keys are
+    // only ~22 px tall, so fall back to the bare number in a thin band.
+    let has_caption = code != 0 && code != 32;
+    let full_caption = has_caption && h >= CP437_FULL_CAPTION_H;
+    let show_caption = has_caption && h >= CP437_COMPACT_CAPTION_H;
     let named = code == 0 || code == 32 || cp437::is_named_blank(code);
     let label = if code == 32 {
         "BS".to_string()
@@ -2540,23 +2570,37 @@ unsafe fn draw_cp437_key(hdc: HDC, state: &AppState, client: RECT, code: u8) {
             left: rc.left + 2,
             top: rc.top + 2,
             right: rc.right - 2,
-            bottom: rc.bottom - (h / 3).max(12),
+            bottom: if full_caption {
+                rc.bottom - (h / 3).max(12)
+            } else {
+                rc.bottom - CP437_COMPACT_CAPTION_BAND
+            },
         };
-        DrawTextW(
-            hdc,
-            &mut label_wide,
-            &mut glyph_rc,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
-        );
+        // The compact band leaves the glyph a little less room than its font
+        // height, so let it overflow slightly instead of being clipped.
+        let glyph_flags = if full_caption {
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS
+        } else {
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOCLIP
+        };
+        DrawTextW(hdc, &mut label_wide, &mut glyph_rc, glyph_flags);
 
-        let cap = format!("Alt+{code}");
+        let cap = if full_caption {
+            format!("Alt+{code}")
+        } else {
+            code.to_string()
+        };
         let mut cap_wide: Vec<u16> = cap.encode_utf16().collect();
         let _ = SelectObject(hdc, HGDIOBJ(state.fonts.caption.0));
         SetTextColor(hdc, rgb(0x9A, 0xA4, 0xB8));
         let mut cap_rc = RECT {
-            left: rc.left + 2,
-            top: glyph_rc.bottom - 1,
-            right: rc.right - 2,
+            left: rc.left + 1,
+            top: if full_caption {
+                glyph_rc.bottom - 1
+            } else {
+                rc.bottom - CP437_COMPACT_CAPTION_BAND - 1
+            },
+            right: rc.right - 1,
             bottom: rc.bottom - 1,
         };
         DrawTextW(
