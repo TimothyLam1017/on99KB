@@ -13,21 +13,26 @@
 
 #![cfg(windows)]
 
+mod a11y;
+
 use on99kb::{cp437, prefs, simplex};
+use std::cell::RefCell;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use windows::core::{w, Result as WinResult, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen,
     CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetGlyphIndicesW,
-    GetStockObject, InvalidateRect, RoundRect, ScreenToClient, SelectObject, SetBkMode,
-    SetTextColor, BLACK_BRUSH, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
-    DEFAULT_PITCH, DT_CENTER, DT_END_ELLIPSIS, DT_NOCLIP, DT_RIGHT, DT_SINGLELINE, DT_TOP,
-    DT_VCENTER, FF_DONTCARE, FW_NORMAL, FW_SEMIBOLD, GGI_MARK_NONEXISTING_GLYPHS, HBRUSH, HDC,
-    HFONT, HGDIOBJ, HPEN, OUT_TT_PRECIS, PAINTSTRUCT, PS_INSIDEFRAME, PS_SOLID, SRCCOPY,
-    TRANSPARENT,
+    GetStockObject, IntersectClipRect, InvalidateRect, RoundRect, ScreenToClient, SelectClipRgn,
+    SelectObject, SetBkMode, SetTextColor, BLACK_BRUSH, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
+    DEFAULT_CHARSET, DEFAULT_PITCH, DT_CENTER, DT_END_ELLIPSIS, DT_NOCLIP, DT_RIGHT, DT_SINGLELINE,
+    DT_TOP, DT_VCENTER, FF_DONTCARE, FW_NORMAL, FW_SEMIBOLD, GGI_MARK_NONEXISTING_GLYPHS, HBITMAP,
+    HBRUSH, HDC, HFONT, HGDIOBJ, HPEN, HRGN, OUT_TT_PRECIS, PAINTSTRUCT, PS_INSIDEFRAME, PS_SOLID,
+    SRCCOPY, TRANSPARENT,
 };
+use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
     AdjustWindowRectExForDpi, GetDpiForWindow, SetProcessDpiAwarenessContext,
@@ -51,10 +56,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SM_CXVIRTUALSCREEN, SM_CYSMICON, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNOACTIVATE, WINDOW_EX_STYLE,
     WINDOW_STYLE, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_EXITSIZEMOVE,
-    WM_GETMINMAXINFO, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_MOVE, WM_PAINT, WM_SETCURSOR, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_EX_APPWINDOW,
-    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
-    WS_THICKFRAME,
+    WM_GETMINMAXINFO, WM_GETOBJECT, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_MOVE, WM_PAINT, WM_SETCURSOR, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_CAPTION,
+    WS_EX_APPWINDOW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_MINIMIZEBOX, WS_POPUP,
+    WS_SYSMENU, WS_THICKFRAME,
 };
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
@@ -191,6 +196,39 @@ fn handle_nonzero<T: Copy + PartialEq + Default>(h: T) -> bool {
 
 fn pt_in(rc: RECT, x: i32, y: i32) -> bool {
     x >= rc.left && x < rc.right && y >= rc.top && y < rc.bottom
+}
+
+fn rects_overlap(a: RECT, b: RECT) -> bool {
+    a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
+}
+
+/// Repaint just the keys whose hover/pressed look changed, plus the status
+/// hint (its text follows hover). Falls back to a full repaint if a key's
+/// rect is unknown.
+fn invalidate_hits(hwnd: HWND, state: &AppState, hits: &[Option<Hit>]) {
+    let client = client_rect(hwnd);
+    unsafe {
+        for hit in hits.iter().flatten() {
+            match state.hit_rect(client, *hit) {
+                Some(rc) => {
+                    // Rounded-rect outlines sit on the edge; pad by 1 px.
+                    let rc = RECT {
+                        left: rc.left - 1,
+                        top: rc.top - 1,
+                        right: rc.right + 1,
+                        bottom: rc.bottom + 1,
+                    };
+                    let _ = InvalidateRect(hwnd, Some(&rc), false);
+                }
+                None => {
+                    let _ = InvalidateRect(hwnd, None, false);
+                    return;
+                }
+            }
+        }
+        let hint = AppState::hint_rect(client);
+        let _ = InvalidateRect(hwnd, Some(&hint), false);
+    }
 }
 
 fn title_for(mode: Mode) -> &'static str {
@@ -402,6 +440,31 @@ struct AppState {
     fonts: Fonts,
     brushes: Brushes,
     font_key: (i32, i32, i32, u8),
+    /// 速成 layout for the last (width, height, symbols_open). Rebuilt only
+    /// when one of those changes, so hover / hit-test / paint don't allocate.
+    simplex_cache: RefCell<Option<(LayoutKey, Rc<SimplexLayout>)>>,
+    /// Off-screen buffer kept across paints so only dirty rects are redrawn.
+    backbuf: Option<BackBuffer>,
+}
+
+/// (client width, client height, symbols_open).
+type LayoutKey = (i32, i32, bool);
+
+/// Persistent memory DC + bitmap for double buffering. Recreated on resize.
+struct BackBuffer {
+    dc: HDC,
+    bmp: HBITMAP,
+    old: HGDIOBJ,
+    w: i32,
+    h: i32,
+}
+
+impl BackBuffer {
+    unsafe fn release(&mut self) {
+        SelectObject(self.dc, self.old);
+        let _ = DeleteObject(HGDIOBJ(self.bmp.0));
+        let _ = DeleteDC(self.dc);
+    }
 }
 
 impl AppState {
@@ -436,6 +499,8 @@ impl AppState {
                     compose_pen: CreatePen(PS_INSIDEFRAME, dp(2).max(1), rgb(0x3E, 0x6E, 0xA8)),
                 },
                 font_key: (0, 0, 0, 255),
+                simplex_cache: RefCell::new(None),
+                backbuf: None,
             })
         }
     }
@@ -890,6 +955,75 @@ fn simplex_layout(client: RECT, symbols_open: bool) -> SimplexLayout {
 }
 
 impl AppState {
+    /// Cached 速成 layout. Keyed by client size and the 符號 toggle, so a
+    /// resize or toggle rebuilds it once and every other call is a clone of
+    /// an `Rc`.
+    fn layout(&self, client: RECT) -> Rc<SimplexLayout> {
+        let key = (
+            client.right - client.left,
+            client.bottom - client.top,
+            self.symbols_open,
+        );
+        let mut cache = self.simplex_cache.borrow_mut();
+        if let Some((k, layout)) = cache.as_ref() {
+            if *k == key {
+                return Rc::clone(layout);
+            }
+        }
+        let layout = Rc::new(simplex_layout(client, self.symbols_open));
+        *cache = Some((key, Rc::clone(&layout)));
+        layout
+    }
+
+    fn invalidate_layout(&self) {
+        *self.simplex_cache.borrow_mut() = None;
+    }
+
+    /// Screen rect a hit target is drawn in, used to repaint just that key.
+    fn hit_rect(&self, client: RECT, hit: Hit) -> Option<RECT> {
+        let find = |v: &[(char, RECT)], c: char| v.iter().find(|(k, _)| *k == c).map(|(_, r)| *r);
+        match hit {
+            Hit::Cp437(code) => Some(Self::cell_rect(client, code)),
+            Hit::Mode(m) => Some(Self::mode_segment_rect(client, m)),
+            Hit::Opacity => Some(Self::opacity_rect(client)),
+            Hit::AsciiSpace => Some(Self::space_bar_rect(client)),
+            Hit::Brand | Hit::PagePrev | Hit::PageNext | Hit::Candidate(_) => {
+                let (brand, _, slots, prev, next) = candidate_parts(client);
+                Some(match hit {
+                    Hit::Brand => brand,
+                    Hit::PagePrev => prev,
+                    Hit::PageNext => next,
+                    Hit::Candidate(i) => *slots.get(i as usize)?,
+                    _ => unreachable!(),
+                })
+            }
+            _ if self.mode != Mode::Simplex => None,
+            Hit::Backspace => Some(self.layout(client).backspace),
+            Hit::Digit(c) => find(&self.layout(client).digits, c),
+            Hit::Punct(c) => find(&self.layout(client).puncts, c),
+            Hit::Letter(c) => find(&self.layout(client).letters, c),
+            Hit::Latin(c) => find(&self.layout(client).english, c),
+            Hit::Nav(n) => self
+                .layout(client)
+                .navs
+                .iter()
+                .find(|(k, _)| *k == n)
+                .map(|(_, r)| *r),
+            Hit::Symbol(c) => self
+                .layout(client)
+                .symbols
+                .iter()
+                .find(|(k, _, _)| *k == c)
+                .map(|(_, r, _)| *r),
+            Hit::Delete | Hit::Clear | Hit::Space | Hit::SymbolToggle => self
+                .layout(client)
+                .actions
+                .iter()
+                .find(|(k, _, _)| *k == hit)
+                .map(|(_, _, r)| *r),
+        }
+    }
+
     fn hit_test(&self, client: RECT, x: i32, y: i32) -> Option<Hit> {
         for m in [Mode::Cp437, Mode::Simplex] {
             if pt_in(AppState::mode_segment_rect(client, m), x, y) {
@@ -919,7 +1053,7 @@ impl AppState {
                     return Some(Hit::Candidate(i as u8));
                 }
             }
-            let layout = simplex_layout(client, self.symbols_open);
+            let layout = self.layout(client);
             if pt_in(layout.backspace, x, y) {
                 return Some(Hit::Backspace);
             }
@@ -944,21 +1078,22 @@ impl AppState {
                 }
             }
             if self.symbols_open {
-                for (ch, rc, _) in layout.symbols {
-                    if pt_in(rc, x, y) {
+                for (ch, rc, _) in &layout.symbols {
+                    if pt_in(*rc, x, y) {
+                        let ch = *ch;
                         return Some(Hit::Symbol(ch));
                     }
                 }
             } else {
-                for (ch, rc) in layout.letters {
-                    if pt_in(rc, x, y) {
-                        return Some(Hit::Letter(ch));
+                for (ch, rc) in &layout.letters {
+                    if pt_in(*rc, x, y) {
+                        return Some(Hit::Letter(*ch));
                     }
                 }
             }
-            for (ch, rc) in layout.english {
-                if pt_in(rc, x, y) {
-                    return Some(Hit::Latin(ch));
+            for (ch, rc) in &layout.english {
+                if pt_in(*rc, x, y) {
+                    return Some(Hit::Latin(*ch));
                 }
             }
             return None;
@@ -987,7 +1122,7 @@ impl AppState {
             let grid = Self::grid_rect(client);
             (((grid.bottom - grid.top) / ROWS).max(1), 0)
         } else {
-            let layout = simplex_layout(client, self.symbols_open);
+            let layout = self.layout(client);
             (layout.letter_h.max(1), layout.english_h.max(1))
         };
         let cand_h = dp(CANDIDATE_ROW_H);
@@ -1072,6 +1207,9 @@ impl AppState {
 impl Drop for AppState {
     fn drop(&mut self) {
         unsafe {
+            if let Some(mut buf) = self.backbuf.take() {
+                buf.release();
+            }
             self.fonts.delete();
             let objs = [
                 HGDIOBJ(self.brushes.bg.0),
@@ -1418,6 +1556,8 @@ pub fn run() -> WinResult<()> {
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         SetCurrentProcessExplicitAppUserModelID(w!("TimothyLam1017.on99KB"))?;
+        // COM (STA) is needed to hand screen readers our IAccessible.
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
 
         let instance = GetModuleHandleW(None)?;
         let class_name = w!("on99KB.Window");
@@ -1548,6 +1688,8 @@ pub fn run() -> WinResult<()> {
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+        WM_GETOBJECT => a11y::on_get_object(hwnd, wparam, lparam)
+            .unwrap_or_else(|| DefWindowProcW(hwnd, msg, wparam, lparam)),
         WM_ERASEBKGND => LRESULT(1),
         WM_GETMINMAXINFO => {
             let info = lparam.0 as *mut MINMAXINFO;
@@ -1578,6 +1720,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             if let Some(state) = state_mut(hwnd) {
                 state.font_key = (0, 0, 0, 255);
+                state.invalidate_layout();
             }
             let _ = InvalidateRect(hwnd, None, false);
             LRESULT(0)
@@ -1594,6 +1737,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             if let Some(state) = state_mut(hwnd) {
                 state.font_key = (0, 0, 0, 255);
+                state.invalidate_layout();
             }
             let _ = InvalidateRect(hwnd, None, false);
             LRESULT(0)
@@ -1621,7 +1765,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             }
                         }
                     }
-                    let _ = InvalidateRect(hwnd, None, false);
+                    invalidate_hits(hwnd, state, &[state.pressed]);
                 }
             }
             LRESULT(0)
@@ -1636,6 +1780,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         simplex_page_next(state);
                     }
                     let _ = InvalidateRect(hwnd, None, false);
+                    a11y::notify_reorder(hwnd);
                 }
             }
             LRESULT(0)
@@ -1670,8 +1815,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
                 let hit = state.hit_test(rc, x, y);
                 if state.hover != hit {
+                    let old = state.hover;
                     state.hover = hit;
-                    let _ = InvalidateRect(hwnd, None, false);
+                    invalidate_hits(hwnd, state, &[old, hit]);
+                    a11y::notify_state(hwnd, state, &[old, hit]);
                 }
             }
             LRESULT(0)
@@ -1679,8 +1826,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_MOUSELEAVE => {
             if let Some(state) = state_mut(hwnd) {
                 state.tracking = false;
-                state.hover = None;
-                let _ = InvalidateRect(hwnd, None, false);
+                let old = state.hover.take();
+                invalidate_hits(hwnd, state, &[old]);
+                a11y::notify_state(hwnd, state, &[old]);
             }
             LRESULT(0)
         }
@@ -1694,7 +1842,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if let Some(Hit::Latin(_)) = state.pressed {
                     let _ = SetTimer(hwnd, LATIN_HOLD_TIMER_ID, LATIN_HOLD_MS, None);
                 }
-                let _ = InvalidateRect(hwnd, None, false);
+                invalidate_hits(hwnd, state, &[state.pressed]);
+                a11y::notify_state(hwnd, state, &[state.pressed]);
             }
             let _ = SetCapture(hwnd);
             LRESULT(0)
@@ -1726,6 +1875,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     _ => {}
                 }
                 let _ = InvalidateRect(hwnd, None, false);
+                a11y::notify_reorder(hwnd);
             }
             LRESULT(0)
         }
@@ -1870,45 +2020,82 @@ unsafe fn paint(hwnd: HWND) {
     let width = (rc.right - rc.left).max(1);
     let height = (rc.bottom - rc.top).max(1);
 
-    let mem = CreateCompatibleDC(hdc);
-    let bmp = CreateCompatibleBitmap(hdc, width, height);
-    let old_bmp = SelectObject(mem, HGDIOBJ(bmp.0));
+    let Some(state) = state_mut(hwnd) else {
+        FillRect(hdc, &rc, HBRUSH(GetStockObject(BLACK_BRUSH).0));
+        let _ = EndPaint(hwnd, &ps);
+        return;
+    };
 
-    if let Some(state) = state_mut(hwnd) {
-        state.ensure_fonts(rc);
-        FillRect(mem, &rc, state.brushes.bg);
+    // Reuse the back buffer between paints; only recreate it on resize.
+    let mut dirty = ps.rcPaint;
+    if !matches!(&state.backbuf, Some(b) if b.w == width && b.h == height) {
+        if let Some(mut old) = state.backbuf.take() {
+            old.release();
+        }
+        let dc = CreateCompatibleDC(hdc);
+        let bmp = CreateCompatibleBitmap(hdc, width, height);
+        let old = SelectObject(dc, HGDIOBJ(bmp.0));
+        state.backbuf = Some(BackBuffer {
+            dc,
+            bmp,
+            old,
+            w: width,
+            h: height,
+        });
+        // A fresh bitmap has no prior frame to keep.
+        dirty = rc;
+    }
+    let mem = state.backbuf.as_ref().map(|b| b.dc).unwrap_or(hdc);
 
-        let footer_rc = AppState::footer_rect(rc);
-        FillRect(mem, &footer_rc, state.brushes.status);
+    state.ensure_fonts(rc);
+    let _ = IntersectClipRect(mem, dirty.left, dirty.top, dirty.right, dirty.bottom);
+    FillRect(mem, &dirty, state.brushes.bg);
 
-        let old_pen = SelectObject(mem, HGDIOBJ(state.brushes.border.0));
-        let _ = SetBkMode(mem, TRANSPARENT);
+    let footer_rc = AppState::footer_rect(rc);
+    FillRect(mem, &footer_rc, state.brushes.status);
 
-        match state.mode {
-            Mode::Cp437 => {
-                for code in 0u8..=255 {
+    let status_rc = AppState::status_rect(rc);
+    FillRect(mem, &status_rc, state.brushes.status);
+
+    let old_pen = SelectObject(mem, HGDIOBJ(state.brushes.border.0));
+    // The back buffer outlives this paint, so put its original font back at
+    // the end; otherwise ensure_fonts could not delete a selected font.
+    let old_font = SelectObject(mem, HGDIOBJ(state.fonts.status.0));
+    let _ = SetBkMode(mem, TRANSPARENT);
+
+    match state.mode {
+        Mode::Cp437 => {
+            for code in 0u8..=255 {
+                if rects_overlap(AppState::cell_rect(rc, code), dirty) {
                     draw_cp437_key(mem, state, rc, code);
                 }
             }
-            Mode::Simplex => {
-                draw_simplex(mem, state, rc);
-            }
         }
-
-        draw_mode_switch(mem, state, rc);
-        draw_opacity_btn(mem, state, rc);
-        draw_ascii_space_bar(mem, state, rc);
-        draw_hint(mem, state, rc);
-
-        SelectObject(mem, old_pen);
-    } else {
-        FillRect(mem, &rc, HBRUSH(GetStockObject(BLACK_BRUSH).0));
+        Mode::Simplex => {
+            draw_simplex(mem, state, rc, dirty);
+        }
     }
 
-    let _ = BitBlt(hdc, 0, 0, width, height, mem, 0, 0, SRCCOPY);
-    SelectObject(mem, old_bmp);
-    let _ = DeleteObject(HGDIOBJ(bmp.0));
-    let _ = DeleteDC(mem);
+    draw_mode_switch(mem, state, rc);
+    draw_opacity_btn(mem, state, rc);
+    draw_ascii_space_bar(mem, state, rc);
+    draw_hint(mem, state, rc);
+
+    SelectObject(mem, old_font);
+    SelectObject(mem, old_pen);
+    let _ = SelectClipRgn(mem, HRGN::default());
+
+    let _ = BitBlt(
+        hdc,
+        dirty.left,
+        dirty.top,
+        dirty.right - dirty.left,
+        dirty.bottom - dirty.top,
+        mem,
+        dirty.left,
+        dirty.top,
+        SRCCOPY,
+    );
     let _ = EndPaint(hwnd, &ps);
 }
 
@@ -2116,7 +2303,7 @@ fn hint_text(state: &AppState) -> String {
     }
 }
 
-unsafe fn draw_simplex(hdc: HDC, state: &AppState, client: RECT) {
+unsafe fn draw_simplex(hdc: HDC, state: &AppState, client: RECT, dirty: RECT) {
     let (brand_rc, codes_rc, slots, prev, next) = candidate_parts(client);
     draw_brand_chip(hdc, state, brand_rc);
     // Codes / mode label in the candidate bar (so 符號 mode is obvious).
@@ -2194,31 +2381,36 @@ unsafe fn draw_simplex(hdc: HDC, state: &AppState, client: RECT) {
     draw_page_btn(hdc, state, prev, Hit::PagePrev, prev_label, can_prev);
     draw_page_btn(hdc, state, next, Hit::PageNext, next_label, can_next);
 
-    let layout = simplex_layout(client, state.symbols_open);
-    for (ch, rc) in &layout.digits {
+    // Skip keys outside the dirty rect: a hover repaint touches 1–2 keys,
+    // not the ~70 on the 速成 keyboard.
+    let vis = |rc: RECT| rects_overlap(rc, dirty);
+    let layout = state.layout(client);
+    for (ch, rc) in layout.digits.iter().filter(|(_, rc)| vis(*rc)) {
         draw_labeled_key(hdc, state, *rc, &ch.to_string(), Hit::Digit(*ch), false);
     }
-    draw_labeled_key(hdc, state, layout.backspace, "Bksp", Hit::Backspace, true);
-    for (ch, rc) in &layout.puncts {
+    if vis(layout.backspace) {
+        draw_labeled_key(hdc, state, layout.backspace, "Bksp", Hit::Backspace, true);
+    }
+    for (ch, rc) in layout.puncts.iter().filter(|(_, rc)| vis(*rc)) {
         draw_labeled_key(hdc, state, *rc, &ch.to_string(), Hit::Punct(*ch), false);
     }
-    for (nav, rc) in &layout.navs {
+    for (nav, rc) in layout.navs.iter().filter(|(_, rc)| vis(*rc)) {
         draw_labeled_key(hdc, state, *rc, nav.label(), Hit::Nav(*nav), false);
     }
     if state.symbols_open {
-        for (ch, rc, keycap) in layout.symbols {
-            draw_symbol_key(hdc, state, rc, ch, keycap, Hit::Symbol(ch));
+        for (ch, rc, keycap) in layout.symbols.iter().filter(|(_, rc, _)| vis(*rc)) {
+            draw_symbol_key(hdc, state, *rc, *ch, keycap, Hit::Symbol(*ch));
         }
     } else {
-        for (ch, rc) in layout.letters {
-            draw_letter_key(hdc, state, rc, ch);
+        for (ch, rc) in layout.letters.iter().filter(|(_, rc)| vis(*rc)) {
+            draw_letter_key(hdc, state, *rc, *ch);
         }
     }
-    for (ch, rc) in layout.english {
-        draw_english_key(hdc, state, rc, ch);
+    for (ch, rc) in layout.english.iter().filter(|(_, rc)| vis(*rc)) {
+        draw_english_key(hdc, state, *rc, *ch);
     }
-    for (hit, label, rc) in layout.actions {
-        draw_action_key(hdc, state, rc, label, hit);
+    for (hit, label, rc) in layout.actions.iter().filter(|(_, _, rc)| vis(*rc)) {
+        draw_action_key(hdc, state, *rc, label, *hit);
     }
 }
 
