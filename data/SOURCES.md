@@ -74,3 +74,54 @@ z ─  x │  c ◎  v §  b ←  n →  m 。  , ，  . ‧  / ？
 ```
 
 旺財’s requested range 「┌」 through 「※」 is key 1 through key R. on99KB includes at least that span, and also the rest of the same official keyboard (keys after R, plus € on backtick). No extra box-drawing or punctuation (═, ╪, ╳, …, etc.) is added beyond these sources. The physical Ctrl+Alt+, shortcut is not implemented; the on-screen 符號 button is mouse-only and does not steal focus.
+
+## 九方 字型 (shape input) table — independently constructed
+
+「九方」 is the common, unofficial name for this method. on99KB is **not
+affiliated with, not licensed by, and not supported by 九方科技**. No official
+九方科技 code table, codebook file, trial dump, binary, artwork, font or
+screenshot was copied, extracted, scraped, OCR’d or consulted to build this
+table, and none is redistributed. 快碼 / `qcode.cin` is **not** used as a
+substitute.
+
+- File: `data/jiufang-shape.txt` (compiled into the exe by `build.rs`).
+- Origin: written by hand for on99KB from the locked public rules in
+  [`docs/JIUFANG-TYPOGRAPHY.md`](../docs/JIUFANG-TYPOGRAPHY.md): the
+  upper-half split test (整體字／分體字), the three-key code `F C X`, the
+  publicly taught feature labels (7撇 8橫 9豎 / 4折 5圓 6點 / 1十 2交 3缺), and
+  on99KB’s **own** component chart (§5.2). Each character’s code was assigned
+  by applying those rules to its shape.
+- Public teaching examples it agrees with (cited as examples, not as an
+  extracted table): 前 = 470, 月 = 390, 光 = 850, 是 = 690, 上 = 880 (Clement
+  Yui-Wah Lee, *How to Use the Q9 Input Method*, CC BY 3.0,
+  http://bit.ly/Q9Tutorial); 晶／壘 整體 and 禁／響 分體 (course slides
+  attributed to 梁立人、劉文建); 香 整體 and 港 分體 (九方科技 public input steps
+  page, https://qcode.com/web10/page.php?c=130&newLang=tc — procedure and
+  class only).
+- Patent: HK1035043 / US 6,922,811 (filed 1 November 1999) is treated as
+  expired; only basic shape input is implemented. Patent expiry is not a
+  licence to copy official software or tables. This is not legal clearance.
+- Licence: the table is original work of the on99KB project and is released
+  under the project’s MIT licence (see `LICENSE`).
+- Coverage: a deliberately small starter set of common characters. Divergence
+  from official Q9 listings, codes or candidate order is expected and is not
+  a defect. Users may supply a fuller table (see below).
+- Golden set: `data/jiufang-golden.tsv` (gate G2) locks expected class, key
+  sequence and candidate page for the cited examples and paging cases.
+
+### Table file format (built-in and user override)
+
+- Encoding: UTF-8 (a leading BOM is ignored). Lines ending in LF or CRLF.
+- Blank lines and lines starting with `#` are comments.
+- Each data line: a three-digit code, whitespace, then the candidates in
+  order. Candidates may be written run together (`690 日是晶`) or separated by
+  spaces. Each candidate is one Unicode scalar value (non-BMP allowed).
+- Code digits: first = upper-left feature `1`–`9`, second = component `1`–`9`,
+  third = `0` for 整體字 or the upper-right feature `1`–`9` for 分體字. Any other
+  code is ignored.
+- The same code may appear on several lines; the lists are appended in file
+  order. A character repeated under the same code is kept only once (first
+  position wins).
+- User override: if `%APPDATA%\on99KB\jiufang.txt` exists and contains at
+  least one valid line, it **replaces** the built-in table at start-up.
+  Otherwise the built-in table is used.

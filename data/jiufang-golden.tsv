@@ -1,0 +1,37 @@
+# on99KB 九方 字型 golden set (gate G2). Locked before engine code.
+#
+# Columns (tab-separated, UTF-8):
+#   char    the character
+#   class   整體 or 分體, decided by the upper half only (docs/JIUFANG-TYPOGRAPHY.md §2)
+#   keys    the three code keys F C X (X = 0 for 整體, X = 1..9 for 分體)
+#   page    1-based candidate page the character must appear on after the
+#           code (page 2 means one press of 0 after the code); "1" means the
+#           first page
+#   source  why this row is here
+#
+# The engine must agree with every row: looking up `keys` gives a candidate
+# list that contains `char` on `page`, and the class implied by X matches
+# `class`. Rows marked "teaching" are public tutorial examples (cited in
+# docs/JIUFANG-TYPOGRAPHY.md); the rest follow on99KB's own component chart.
+#
+# char	class	keys	page	source
+禁	分體	1 2 1	1	teaching: upper 林 splits (梁立人、劉文建 slides)
+響	分體	4 3 4	1	teaching: upper 鄉 splits (梁立人、劉文建 slides)
+晶	整體	6 9 0	1	teaching: upper 日 does not split (梁立人、劉文建 slides)
+壘	整體	5 1 0	1	teaching: upper 田 does not split (梁立人、劉文建 slides)
+前	整體	4 7 0	1	teaching: 前 = 470 (Clement Lee, CC BY 3.0)
+月	整體	3 9 0	1	teaching: 月 = 390 (Clement Lee, CC BY 3.0)
+光	整體	8 5 0	1	teaching: 光 = 850 (Clement Lee, CC BY 3.0)
+是	整體	6 9 0	1	teaching: 是 = 690 (Clement Lee, CC BY 3.0)
+上	整體	8 8 0	1	teaching: 上 = 880 (Clement Lee, CC BY 3.0)
+香	整體	7 4 0	1	teaching class: 香 is a 整體字 (九方科技 input steps page)
+港	分體	6 1 1	1	teaching class: 港 is a 分體字 (九方科技 input steps page)
+林	分體	1 2 1	1	on99KB chart: left 木 (1-2), right 木 → feature 1
+明	分體	6 9 3	1	on99KB chart: left 日 (6-9), right 月 → feature 3
+你	分體	7 1 7	1	on99KB chart: left 亻 (7-1), right 尔 head → feature 7
+好	分體	4 5 4	1	on99KB chart: left 女 (4-5), right 子 → feature 4
+國	整體	5 2 0	1	on99KB chart: upper 囗 does not split
+家	整體	6 2 0	1	on99KB chart: upper 宀 does not split
+花	整體	1 3 0	1	on99KB chart: upper 艹 does not split
+晃	整體	6 9 0	2	paging: 690 has more than nine candidates
+華	整體	1 3 0	2	paging: 130 has more than nine candidates
