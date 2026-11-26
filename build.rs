@@ -13,8 +13,10 @@ fn main() {
     println!("cargo:rerun-if-changed=data/HKSCS2016.json");
     println!("cargo:rerun-if-changed=res/app.rc");
     println!("cargo:rerun-if-changed=assets/icon.ico");
+    println!("cargo:rerun-if-changed=data/opencc");
 
     generate_table(&manifest);
+    generate_hk2s(&manifest);
 
     let os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let abi = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
@@ -328,4 +330,65 @@ fn generate_table(manifest: &Path) {
         bin.len()
     );
     fs::write(out.with_extension("txt"), summary).ok();
+}
+
+/// Load an OpenCC text dictionary (`key<TAB>value value…`) keeping only
+/// single-character keys, with the first value as OpenCC's default.
+fn load_opencc_chars(path: &Path) -> BTreeMap<char, char> {
+    let text = fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let mut out = BTreeMap::new();
+    for line in text.lines() {
+        if line.starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('\t') else {
+            continue;
+        };
+        let mut kc = k.chars();
+        let (Some(key), None) = (kc.next(), kc.next()) else {
+            continue;
+        };
+        let Some(first) = v.split(' ').next() else {
+            continue;
+        };
+        let mut vc = first.chars();
+        let (Some(val), None) = (vc.next(), vc.next()) else {
+            continue;
+        };
+        out.entry(key).or_insert(val);
+    }
+    out
+}
+
+/// Precompute OpenCC `hk2s` for single characters, following
+/// `data/opencc/hk2s.json`: CJK compatibility normalisation, then
+/// HKVariantsRev (HK variant → OpenCC traditional), then TSCharacters
+/// (traditional → simplified, first value). The phrase dictionaries in that
+/// config (HKVariantsRevPhrases, TSPhrases) contain no single-character keys,
+/// and the optional TSCharactersExt (tofu-risk) group is not enabled, which is
+/// OpenCC's default. Output: sorted (from, to) u32 pairs for every character
+/// that changes.
+fn generate_hk2s(manifest: &Path) {
+    let dir = manifest.join("data/opencc");
+    let norm = load_opencc_chars(&dir.join("CJK_Compatibility_Ideographs.txt"));
+    let rev = load_opencc_chars(&dir.join("HKVariantsRev.txt"));
+    let ts = load_opencc_chars(&dir.join("TSCharacters.txt"));
+    let mut keys: Vec<char> = norm.keys().chain(rev.keys()).chain(ts.keys()).copied().collect();
+    keys.sort();
+    keys.dedup();
+    let mut bin = Vec::new();
+    let mut n = 0u32;
+    for c in keys {
+        let a = norm.get(&c).copied().unwrap_or(c);
+        let b = rev.get(&a).copied().unwrap_or(a);
+        let s = ts.get(&b).copied().unwrap_or(b);
+        if s != c {
+            bin.extend_from_slice(&u32::from(c).to_le_bytes());
+            bin.extend_from_slice(&u32::from(s).to_le_bytes());
+            n += 1;
+        }
+    }
+    let out = PathBuf::from(env::var("OUT_DIR").unwrap()).join("hk2s.bin");
+    fs::write(&out, &bin).expect("write hk2s.bin");
+    fs::write(out.with_extension("txt"), format!("pairs={n}\n")).ok();
 }

@@ -1,4 +1,5 @@
-//! Remembered window size, position, opacity, always-on-top, and keyboard mode.
+//! Remembered window size, position, opacity, always-on-top, keyboard mode,
+//! output script (繁／簡), and the 數墊 numpad-capture toggle.
 
 /// First-launch and minimum CP437 client size, in 96-DPI design pixels
 /// (device-independent pixels). The app scales these to the window's DPI, so
@@ -70,11 +71,14 @@ impl Opacity {
     }
 }
 
-/// Keyboard layout mode. Missing or invalid ini values default to CP437.
+/// Visible keyboard layout. Missing or invalid ini values default to CP437.
+/// The 九方 numpad overlay never changes this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyboardMode {
     Cp437,
     Simplex,
+    /// 九方 (shape input; computer numpad). Unofficial common name.
+    Jiufang,
 }
 
 impl KeyboardMode {
@@ -84,6 +88,7 @@ impl KeyboardMode {
         match self {
             Self::Cp437 => "cp437",
             Self::Simplex => "simplex",
+            Self::Jiufang => "jiufang",
         }
     }
 
@@ -91,10 +96,42 @@ impl KeyboardMode {
         match s.trim() {
             "cp437" => Some(Self::Cp437),
             "simplex" => Some(Self::Simplex),
+            "jiufang" => Some(Self::Jiufang),
             _ => None,
         }
     }
 }
+
+/// Script of Chinese characters typed from 速成 and 九方. Coding and lookup
+/// are always Traditional; 簡 only converts the output (OpenCC `hk2s`).
+/// Missing or invalid ini values default to Traditional.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputScript {
+    Traditional,
+    Simplified,
+}
+
+impl OutputScript {
+    pub const DEFAULT: Self = Self::Traditional;
+
+    pub fn as_ini(self) -> &'static str {
+        match self {
+            Self::Traditional => "traditional",
+            Self::Simplified => "simplified",
+        }
+    }
+
+    pub fn from_ini(s: &str) -> Option<Self> {
+        match s.trim() {
+            "traditional" => Some(Self::Traditional),
+            "simplified" => Some(Self::Simplified),
+            _ => None,
+        }
+    }
+}
+
+/// 數墊 toggle default: physical numpad capture is on.
+pub const NUMPAD_CAPTURE_DEFAULT: bool = true;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowPrefs {
@@ -106,6 +143,10 @@ pub struct WindowPrefs {
     /// Always-on-top. Missing or invalid ini values default to `true`.
     pub topmost: bool,
     pub mode: KeyboardMode,
+    /// 繁／簡 output. Missing or invalid → Traditional.
+    pub output: OutputScript,
+    /// 數墊: capture physical numpad 0–9 for 九方. Missing or invalid → on.
+    pub numpad_capture: bool,
     /// `true` when `width` / `height` are 96-DPI design pixels (`units=dip`).
     /// Files written before DPI scaling stored physical pixels and lack the
     /// key; the app converts those using the current monitor's DPI.
@@ -135,6 +176,8 @@ pub fn sanitize(
         opacity,
         topmost,
         mode,
+        output: OutputScript::DEFAULT,
+        numpad_capture: NUMPAD_CAPTURE_DEFAULT,
         dip: true,
     })
 }
@@ -144,7 +187,8 @@ pub fn sanitize(
 /// out-of-range sizes yield `None` (caller uses the default). A missing or
 /// invalid `opacity` falls back to 100%, a missing or invalid `topmost`
 /// falls back to on (1), and a missing or invalid `mode` falls back to
-/// CP437; none of these discard a valid size.
+/// CP437; none of these discard a valid size. `output=` falls back to
+/// traditional and `numpad_capture=` to 1 the same way.
 pub fn parse_window_ini(s: &str) -> Option<WindowPrefs> {
     let mut width = None;
     let mut height = None;
@@ -153,6 +197,8 @@ pub fn parse_window_ini(s: &str) -> Option<WindowPrefs> {
     let mut opacity = Opacity::DEFAULT;
     let mut topmost = true;
     let mut mode = KeyboardMode::DEFAULT;
+    let mut output = OutputScript::DEFAULT;
+    let mut numpad_capture = NUMPAD_CAPTURE_DEFAULT;
     let mut dip = false;
     for raw in s.lines() {
         let line = raw.trim();
@@ -171,6 +217,20 @@ pub fn parse_window_ini(s: &str) -> Option<WindowPrefs> {
         if key == "mode" {
             if let Some(m) = KeyboardMode::from_ini(val) {
                 mode = m;
+            }
+            continue;
+        }
+        if key == "output" {
+            if let Some(o) = OutputScript::from_ini(val) {
+                output = o;
+            }
+            continue;
+        }
+        if key == "numpad_capture" {
+            match val {
+                "1" => numpad_capture = true,
+                "0" => numpad_capture = false,
+                _ => {}
             }
             continue;
         }
@@ -197,18 +257,22 @@ pub fn parse_window_ini(s: &str) -> Option<WindowPrefs> {
     }
     let mut prefs = sanitize(width?, height?, x, y, opacity, topmost, mode)?;
     prefs.dip = dip;
+    prefs.output = output;
+    prefs.numpad_capture = numpad_capture;
     Some(prefs)
 }
 
 pub fn format_window_ini(prefs: &WindowPrefs) -> String {
     let mut s = format!(
-        "# on99KB window size (client area, 96-DPI pixels), opacity, always-on-top, and mode.\n{}width={}\nheight={}\nopacity={}\ntopmost={}\nmode={}\n",
+        "# on99KB window size (client area, 96-DPI pixels), opacity, always-on-top, mode, output and numpad capture.\n{}width={}\nheight={}\nopacity={}\ntopmost={}\nmode={}\noutput={}\nnumpad_capture={}\n",
         if prefs.dip { "units=dip\n" } else { "" },
         prefs.width,
         prefs.height,
         prefs.opacity.percent(),
         if prefs.topmost { 1 } else { 0 },
-        prefs.mode.as_ini()
+        prefs.mode.as_ini(),
+        prefs.output.as_ini(),
+        if prefs.numpad_capture { 1 } else { 0 },
     );
     if let (Some(x), Some(y)) = (prefs.x, prefs.y) {
         s.push_str(&format!("x={x}\ny={y}\n"));
@@ -322,6 +386,86 @@ mod tests {
         assert!(text.contains("mode=simplex"));
         let again = parse_window_ini(&text).unwrap();
         assert_eq!(stored, again);
+    }
+
+    #[test]
+    fn jiufang_mode_round_trips_and_bad_mode_keeps_other_settings() {
+        let p = parse_window_ini(
+            "units=dip\nwidth=500\nheight=470\nx=3\ny=4\nopacity=50\ntopmost=0\nmode=jiufang\n",
+        )
+        .unwrap();
+        assert_eq!(p.mode, KeyboardMode::Jiufang);
+        let text = format_window_ini(&p);
+        assert!(text.contains("mode=jiufang"));
+        assert_eq!(parse_window_ini(&text).unwrap(), p);
+        // Invalid / missing mode → CP437 without dropping anything else.
+        for bad in ["mode=q9\n", "mode=\n", "mode=JIUFANG\n", ""] {
+            let p = parse_window_ini(&format!(
+                "units=dip\nwidth=500\nheight=470\nx=3\ny=4\nopacity=50\ntopmost=0\noutput=simplified\nnumpad_capture=0\n{bad}"
+            ))
+            .unwrap();
+            assert_eq!(p.mode, KeyboardMode::Cp437, "{bad:?}");
+            assert_eq!((p.width, p.height, p.x, p.y), (500, 470, Some(3), Some(4)));
+            assert_eq!(p.opacity, Opacity::P50);
+            assert!(!p.topmost);
+            assert!(p.dip);
+            assert_eq!(p.output, OutputScript::Simplified);
+            assert!(!p.numpad_capture);
+        }
+    }
+
+    #[test]
+    fn output_round_trips_and_falls_back_to_traditional() {
+        for o in [OutputScript::Traditional, OutputScript::Simplified] {
+            let mut p = sanitize(480, 460, None, None, Opacity::P100, true, KeyboardMode::Simplex)
+                .unwrap();
+            p.output = o;
+            let text = format_window_ini(&p);
+            assert!(text.contains(&format!("output={}", o.as_ini())));
+            assert_eq!(parse_window_ini(&text).unwrap(), p);
+        }
+        for bad in ["output=simple\n", "output=\n", "output=1\n", ""] {
+            let p = parse_window_ini(&format!("width=480\nheight=460\nmode=simplex\n{bad}"))
+                .unwrap();
+            assert_eq!(p.output, OutputScript::Traditional, "{bad:?}");
+            assert_eq!(p.mode, KeyboardMode::Simplex);
+            assert_eq!(p.width, 480);
+        }
+    }
+
+    #[test]
+    fn numpad_capture_round_trips_and_falls_back_to_on() {
+        for on in [true, false] {
+            let mut p = sanitize(480, 460, None, None, Opacity::P100, true, KeyboardMode::Cp437)
+                .unwrap();
+            p.numpad_capture = on;
+            let text = format_window_ini(&p);
+            assert!(text.contains(if on { "numpad_capture=1" } else { "numpad_capture=0" }));
+            assert_eq!(parse_window_ini(&text).unwrap(), p);
+        }
+        for bad in ["numpad_capture=2\n", "numpad_capture=yes\n", "numpad_capture=\n", ""] {
+            let p = parse_window_ini(&format!("width=480\nheight=460\ntopmost=0\n{bad}"))
+                .unwrap();
+            assert!(p.numpad_capture, "{bad:?}");
+            assert!(!p.topmost);
+        }
+    }
+
+    #[test]
+    fn older_ini_without_new_keys_keeps_everything() {
+        let p = parse_window_ini(
+            "units=dip\nwidth=600\nheight=520\nopacity=25\ntopmost=0\nmode=simplex\nx=-5\ny=40\n",
+        )
+        .unwrap();
+        assert_eq!((p.width, p.height, p.x, p.y), (600, 520, Some(-5), Some(40)));
+        assert_eq!(p.opacity, Opacity::P25);
+        assert!(!p.topmost);
+        assert!(p.dip);
+        assert_eq!(p.mode, KeyboardMode::Simplex);
+        assert_eq!(p.output, OutputScript::Traditional);
+        assert!(p.numpad_capture);
+        // symbols_open is never written.
+        assert!(!format_window_ini(&p).contains("symbols"));
     }
 
     #[test]
