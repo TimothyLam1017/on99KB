@@ -29,7 +29,7 @@ Clicking a key types that character into the **previously focused** window. The 
 - Fonts: Segoe UI Symbol for CP437 glyphs, Microsoft JhengHei for Chinese labels, Segoe UI for Latin captions. 速成 candidates use Microsoft JhengHei, then MingLiU_HKSCS, then MingLiU_HKSCS-ExtB, so rare HKSCS / Ext-B glyphs are less likely to tofu.
 - Application icon (from `assets/icon.png`) is embedded in the exe and used for the window.
 - Screen readers: the keyboard window exposes each on-screen key to MSAA / UI Automation clients (Narrator, NVDA, JAWS) with a name such as `♥, Alt+3, U+2665` or `日, code A`, a push-button role, hover / pressed / on-off state, and its location. A screen reader's “click” / default action presses the key just like the mouse.
-- Redraws are incremental: hovering or pressing a key repaints only that key and the status hint, and the 速成 layout is computed once per window size and DPI instead of on every mouse move.
+- Redraws are incremental: hovering or pressing a key repaints only that key (with a small DPI-scaled margin) and the status hint. The 速成 layout is cached by window size and the current window DPI; after a DPI change the cache is rebuilt and the screen-reader tree is refreshed.
 
 ## Run the exe
 
