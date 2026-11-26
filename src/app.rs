@@ -123,6 +123,16 @@ const OV_ACTION_H: i32 = 26;
 const OV_PAD: i32 = 6;
 /// Private message the keyboard hook posts for a captured numpad digit.
 const WM_APP_NUMPAD: u32 = 0x8000 + 0x39; // WM_APP + 0x39
+/// The key-up of a captured numpad digit (a deferred numpad commit is typed
+/// only now).
+const WM_APP_NUMPAD_UP: u32 = 0x8000 + 0x3A;
+/// Physical Backspace 清碼 (wparam 0) or the key-up of that press (1).
+const WM_APP_BACKSPACE: u32 = 0x8000 + 0x3B;
+/// Safety net: type a deferred numpad commit even if its key-up never comes.
+const SEND_FLUSH_TIMER_ID: usize = 3;
+const SEND_FLUSH_MS: u32 = 400;
+/// Shown when SendInput could not type a commit; the composition is kept.
+const SEND_FAILED_HINT: &str = "無法輸出到目前視窗";
 
 /// Layout constants above (and the minimum client size in `prefs`) are in
 /// device-independent pixels at 96 DPI (100%). Everything is scaled to the
@@ -484,6 +494,11 @@ struct AppState {
     topmost: bool,
     latin_shifted: bool,
     tracking: bool,
+    /// A numpad commit waiting for the physical key-up of `digit` before it
+    /// is typed: (glyph, digit).
+    pending_send: Option<(char, u8)>,
+    /// The last commit could not be typed (`SendInput` failed).
+    send_failed: bool,
     fonts: Fonts,
     brushes: Brushes,
     font_key: (i32, i32, i32, u8),
@@ -527,6 +542,8 @@ impl AppState {
                 pressed: None,
                 last_typed_cp437: None,
                 last_typed: None,
+                pending_send: None,
+                send_failed: false,
                 opacity: prefs::Opacity::DEFAULT,
                 topmost: true,
                 latin_shifted: false,
@@ -1963,8 +1980,16 @@ fn set_title(hwnd: HWND, mode: Mode) {
 fn apply_action(state: &mut AppState, action: Action) {
     match action {
         Action::Commit(ch) => {
-            let _ = send_unicode(ch);
-            state.last_typed = Some(ch);
+            // The Ime already reset for the next character (pad back to the
+            // feature keys, overlay closed). If the glyph did not reach the
+            // target, undo that so the commit is not treated as done.
+            if send_unicode(ch).is_ok() {
+                state.last_typed = Some(ch);
+                state.send_failed = false;
+            } else {
+                state.ime.restore_failed_commit();
+                state.send_failed = true;
+            }
         }
         Action::SendBackspace => {
             let _ = send_vk(VK_BACK, false);
@@ -1973,12 +1998,36 @@ fn apply_action(state: &mut AppState, action: Action) {
     }
 }
 
-/// Install or remove the numpad hook to match 數墊 and the window state.
+/// Type a deferred numpad commit now (its key-up arrived, its timer fired,
+/// or other input came first and must not overtake it).
+fn flush_pending(hwnd: HWND, state: &mut AppState) {
+    if let Some((ch, _)) = state.pending_send.take() {
+        unsafe {
+            let _ = KillTimer(hwnd, SEND_FLUSH_TIMER_ID);
+        }
+        apply_action(state, Action::Commit(ch));
+    }
+}
+
+/// Install or remove the keyboard hook to match 數墊, the composition state
+/// (physical Backspace 清碼) and the window state.
 fn sync_hook(hwnd: HWND, state: &AppState) {
-    hook::sync(hwnd, state.ime.numpad_capture);
+    hook::sync(hwnd, state.ime.numpad_capture, state.ime.bksp_active());
+}
+
+/// Full repaint after composition changes, so the pad visibly returns to
+/// the feature keys after a commit or 清碼.
+fn refresh_after_input(hwnd: HWND, state: &AppState) {
+    sync_hook(hwnd, state);
+    unsafe {
+        let _ = InvalidateRect(hwnd, None, false);
+    }
+    a11y::notify_reorder(hwnd);
 }
 
 fn activate_hit(hwnd: HWND, state: &mut AppState, hit: Hit) {
+    state.send_failed = false;
+    flush_pending(hwnd, state);
     match hit {
         Hit::Cp437(0) | Hit::Brand => {
             state.topmost = !state.topmost;
@@ -1986,9 +2035,14 @@ fn activate_hit(hwnd: HWND, state: &mut AppState, hit: Hit) {
             schedule_save(hwnd);
         }
         Hit::Cp437(32) => {
-            // The Alt+32 cell is labelled BS and sends Backspace, not a space.
-            let _ = send_vk(VK_BACK, false);
-            state.last_typed_cp437 = Some(32);
+            // The Alt+32 cell is labelled BS and sends Backspace, not a
+            // space. Same 清碼 policy as Bksp: an open 九方 overlay (or 速成
+            // codes underneath) is cleared first; idle it sends VK_BACK.
+            let a = state.ime.backspace();
+            if a == Action::SendBackspace {
+                state.last_typed_cp437 = Some(32);
+            }
+            apply_action(state, a);
         }
         Hit::Cp437(code) => {
             if let Some(ch) = cp437::glyph(code) {
@@ -2323,8 +2377,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             if let Some(state) = state_mut(hwnd) {
                 if minimized {
-                    // Numpad goes back to the target app: drop the overlay
-                    // without committing and remove the hook.
+                    // Numpad goes back to the target app: type a commit
+                    // already made, drop the overlay without committing and
+                    // remove the hook.
+                    flush_pending(hwnd, state);
                     state.ime.on_hidden();
                 }
                 sync_hook(hwnd, state);
@@ -2342,6 +2398,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if wparam.0 == SAVE_TIMER_ID {
                 let _ = KillTimer(hwnd, SAVE_TIMER_ID);
                 save_prefs(hwnd);
+            } else if wparam.0 == SEND_FLUSH_TIMER_ID {
+                let _ = KillTimer(hwnd, SEND_FLUSH_TIMER_ID);
+                if let Some(state) = state_mut(hwnd) {
+                    flush_pending(hwnd, state);
+                    refresh_after_input(hwnd, state);
+                }
             } else if wparam.0 == LATIN_HOLD_TIMER_ID {
                 kill_latin_timer(hwnd);
                 if let Some(state) = state_mut(hwnd) {
@@ -2366,14 +2428,50 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // Posted by the keyboard hook; composition runs here on the UI
             // thread. No focus or activation change.
             if let Some(state) = state_mut(hwnd) {
+                // A commit still waiting for its key-up goes first.
+                flush_pending(hwnd, state);
                 if state.ime.numpad_capture && !IsIconic(hwnd).as_bool() {
-                    let a = state
-                        .ime
-                        .numpad_digit((wparam.0 as u8).min(9), q9::active());
-                    apply_action(state, a);
-                    let _ = InvalidateRect(hwnd, None, false);
-                    a11y::notify_reorder(hwnd);
+                    state.send_failed = false;
+                    let d = (wparam.0 as u8).min(9);
+                    match state.ime.numpad_digit(d, q9::active()) {
+                        // The Ime has already reset (feature keys, overlay
+                        // closed) so the next key-down starts a fresh
+                        // character. The glyph is typed on this key's
+                        // key-up, not while the hook holds the key down.
+                        Action::Commit(ch) => {
+                            state.pending_send = Some((ch, d));
+                            let _ = SetTimer(hwnd, SEND_FLUSH_TIMER_ID, SEND_FLUSH_MS, None);
+                        }
+                        a => apply_action(state, a),
+                    }
                 }
+                refresh_after_input(hwnd, state);
+            }
+            LRESULT(0)
+        }
+        WM_APP_NUMPAD_UP => {
+            if let Some(state) = state_mut(hwnd) {
+                if matches!(state.pending_send, Some((_, d)) if usize::from(d) == wparam.0) {
+                    flush_pending(hwnd, state);
+                }
+                refresh_after_input(hwnd, state);
+            }
+            LRESULT(0)
+        }
+        WM_APP_BACKSPACE => {
+            // Physical Backspace taken by the hook because a composition or
+            // the overlay was active: 清碼, exactly like on-screen Bksp.
+            if let Some(state) = state_mut(hwnd) {
+                if wparam.0 == 0 {
+                    flush_pending(hwnd, state);
+                    state.send_failed = false;
+                    // Normally Action::None. If the composition already
+                    // ended before this ran, the eaten key becomes a
+                    // normal Backspace for the target.
+                    let a = state.ime.backspace();
+                    apply_action(state, a);
+                }
+                refresh_after_input(hwnd, state);
             }
             LRESULT(0)
         }
@@ -2488,8 +2586,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     }
                     _ => {}
                 }
-                let _ = InvalidateRect(hwnd, None, false);
-                a11y::notify_reorder(hwnd);
+                // Repaint everything (faces, overlay) and re-sync the hook:
+                // a click may have started or ended a composition.
+                refresh_after_input(hwnd, state);
             }
             LRESULT(0)
         }
@@ -2500,6 +2599,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_CLOSE => {
             hook::uninstall();
             if let Some(state) = state_mut(hwnd) {
+                flush_pending(hwnd, state);
                 state.ime.on_hidden();
             }
             let _ = KillTimer(hwnd, SAVE_TIMER_ID);
@@ -2986,6 +3086,9 @@ fn q9_hint(state: &AppState) -> String {
 }
 
 fn hint_text(state: &AppState) -> String {
+    if state.send_failed {
+        return SEND_FAILED_HINT.to_string();
+    }
     if let Some(Hit::Output(o)) = state.hover {
         let now = match state.ime.output {
             OutputScript::Traditional => "繁體",
