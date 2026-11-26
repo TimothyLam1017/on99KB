@@ -125,3 +125,33 @@ substitute.
 - User override: if `%APPDATA%\on99KB\jiufang.txt` exists and contains at
   least one valid line, it **replaces** the built-in table at start-up.
   Otherwise the built-in table is used.
+
+## OpenCC `hk2s` (繁 → 簡 output)
+
+- Project: [BYVoid/OpenCC](https://github.com/BYVoid/OpenCC), licence **Apache-2.0**
+  (full text vendored as `data/opencc/LICENSE-OpenCC.txt`; the project has no
+  NOTICE file).
+- Commit used: `fae2a0a911c30764e669a7d8b0591cd8e852934a` (2026-10-29).
+- Configuration: `hk2s.json` (“Traditional Chinese (Hong Kong variant) to
+  Simplified Chinese”, 香港繁體到簡體), vendored as `data/opencc/hk2s.json`.
+  Plain `t2s` is **not** the conversion path.
+- Vendored dictionaries (`data/opencc/`), unmodified, with SHA-256:
+  - `CJK_Compatibility_Ideographs.txt` `e9623acec48d384f99d37d2760bd14a00b6d0cddad7707290dbb0b8c97a2904a`
+  - `HKVariants.txt` `e5cd4345303224587102f2c9e4d2b67d2b7e349c6ce9152e4a118f4656cf7302`
+  - `TSCharacters.txt` `9ff46a7d30e5765375eb13d33f2b03a34d298913caf2b120380679f33ae1642d`
+  - `hk2s.json` `b5fb0d6447f1f111c02a99f405d678b40a97bf73de0a25000219878994a8da37`
+- Generated: `HKVariantsRev.txt`, produced from `HKVariants.txt` with OpenCC’s
+  own `data/scripts/reverse.py` at the same commit (as OpenCC’s build does),
+  plus a one-line provenance comment.
+- How on99KB applies it: `build.rs` precomputes a single-character map
+  following the `hk2s.json` chain — CJK compatibility normalisation →
+  `HKVariantsRev` → `TSCharacters` — and embeds it in the exe (no OpenCC DLL,
+  no C++ FFI). on99KB converts one character at a time; the phrase
+  dictionaries in that chain (`HKVariantsRevPhrases`, `TSPhrases`) have no
+  single-character keys, so they cannot change a single character and are not
+  vendored. The optional `TSCharactersExt` (“tofu-risk”) group is not
+  enabled, which is OpenCC’s default; those entries keep the original
+  character.
+- Ambiguity policy: for one-to-many entries the first listed value (OpenCC’s
+  default) is used. Characters absent from the chain (including many HKSCS
+  characters) are returned unchanged. Coverage is not claimed to be complete.
