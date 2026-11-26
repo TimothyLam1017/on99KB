@@ -1,6 +1,8 @@
 //! Remembered window size, position, opacity, always-on-top, and keyboard mode.
 
-/// First-launch and minimum CP437 client size, in pixels.
+/// First-launch and minimum CP437 client size, in 96-DPI design pixels
+/// (device-independent pixels). The app scales these to the window's DPI, so
+/// at 150% the default client is 720×690 physical pixels.
 ///
 /// Measured from Timothy's expected-default-size screenshot (PNG 495×510
 /// including a teal desktop margin; the window itself is about 482×492
@@ -104,6 +106,10 @@ pub struct WindowPrefs {
     /// Always-on-top. Missing or invalid ini values default to `true`.
     pub topmost: bool,
     pub mode: KeyboardMode,
+    /// `true` when `width` / `height` are 96-DPI design pixels (`units=dip`).
+    /// Files written before DPI scaling stored physical pixels and lack the
+    /// key; the app converts those using the current monitor's DPI.
+    pub dip: bool,
 }
 
 pub fn sanitize(
@@ -129,6 +135,7 @@ pub fn sanitize(
         opacity,
         topmost,
         mode,
+        dip: true,
     })
 }
 
@@ -146,6 +153,7 @@ pub fn parse_window_ini(s: &str) -> Option<WindowPrefs> {
     let mut opacity = Opacity::DEFAULT;
     let mut topmost = true;
     let mut mode = KeyboardMode::DEFAULT;
+    let mut dip = false;
     for raw in s.lines() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
@@ -156,6 +164,10 @@ pub fn parse_window_ini(s: &str) -> Option<WindowPrefs> {
         };
         let key = k.trim();
         let val = v.trim();
+        if key == "units" {
+            dip = val == "dip";
+            continue;
+        }
         if key == "mode" {
             if let Some(m) = KeyboardMode::from_ini(val) {
                 mode = m;
@@ -183,12 +195,15 @@ pub fn parse_window_ini(s: &str) -> Option<WindowPrefs> {
             _ => {}
         }
     }
-    sanitize(width?, height?, x, y, opacity, topmost, mode)
+    let mut prefs = sanitize(width?, height?, x, y, opacity, topmost, mode)?;
+    prefs.dip = dip;
+    Some(prefs)
 }
 
 pub fn format_window_ini(prefs: &WindowPrefs) -> String {
     let mut s = format!(
-        "# on99KB window size (client area, pixels), opacity, always-on-top, and mode.\nwidth={}\nheight={}\nopacity={}\ntopmost={}\nmode={}\n",
+        "# on99KB window size (client area, 96-DPI pixels), opacity, always-on-top, and mode.\n{}width={}\nheight={}\nopacity={}\ntopmost={}\nmode={}\n",
+        if prefs.dip { "units=dip\n" } else { "" },
         prefs.width,
         prefs.height,
         prefs.opacity.percent(),
@@ -307,6 +322,30 @@ mod tests {
         assert!(text.contains("mode=simplex"));
         let again = parse_window_ini(&text).unwrap();
         assert_eq!(stored, again);
+    }
+
+    #[test]
+    fn units_marker_round_trips_and_legacy_is_physical() {
+        // Files from before DPI scaling have no units key: physical pixels.
+        let legacy = parse_window_ini("width=720\nheight=690\n").unwrap();
+        assert!(!legacy.dip);
+        let p = parse_window_ini("units=dip\nwidth=480\nheight=460\n").unwrap();
+        assert!(p.dip);
+        // Newly sanitized prefs are always design pixels and say so.
+        let fresh = sanitize(
+            480,
+            460,
+            None,
+            None,
+            Opacity::P100,
+            true,
+            KeyboardMode::Cp437,
+        )
+        .unwrap();
+        assert!(fresh.dip);
+        let text = format_window_ini(&fresh);
+        assert!(text.contains("units=dip"));
+        assert_eq!(parse_window_ini(&text).unwrap(), fresh);
     }
 
     #[test]
